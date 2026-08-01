@@ -132,12 +132,16 @@ export default function App() {
           </nav>
 
           <div className="ml-auto flex items-center gap-3">
-            {health && !health.gmail_authorised && (
+            {health && !health.gmail_usable && (
               <span
-                title="Run `python -m app.gmail.auth` in the backend directory"
-                className="rounded-lg bg-amber-100 px-2.5 py-1 text-xs font-medium text-amber-900 dark:bg-amber-950 dark:text-amber-300"
+                title={[health.gmail_error, health.gmail_hint].filter(Boolean).join(" ")}
+                className="max-w-96 truncate rounded-lg bg-amber-100 px-2.5 py-1 text-xs font-medium text-amber-900 dark:bg-amber-950 dark:text-amber-300"
               >
-                Gmail not connected
+                {/* Distinguish "no credentials" from "credentials fine, API
+                    unreachable" — the fixes are completely different. */}
+                {health.gmail_authorised
+                  ? (health.gmail_error ?? "Gmail unavailable")
+                  : "Gmail not connected"}
               </span>
             )}
             {health?.gmail_address && (

@@ -70,12 +70,18 @@ Then edit `backend/.env`:
 | `EMBEDDING_MODEL` | Knowledge-base embeddings |
 | `POLL_INTERVAL_SECONDS` | How often the watcher checks for new mail |
 
-> **Model IDs move.** The defaults were current when this was written. Check
-> what your key can actually reach:
+> **Verify your models before the first run.** Availability varies by key and
+> tier — some models are withdrawn from new keys, and Pro models often have no
+> free-tier quota at all.
 >
 > ```powershell
-> .\.venv\Scripts\python.exe -c "from google import genai; [print(m.name) for m in genai.Client().models.list()]"
+> .\.venv\Scripts\python.exe scripts\check_models.py --suggest
 > ```
+>
+> Do **not** rely on `client.models.list()` for this. It lists models that
+> return `404 … no longer available to new users` the moment you call them, and
+> Pro models that return `429`. `check_models.py` probes with the same request
+> the app makes, which is the only answer that means anything.
 
 The app runs without a Gemini key — classification falls back to heuristics and
 Q&A reports that it's unavailable — so you can wire up Gmail first and add the
@@ -83,10 +89,23 @@ key after.
 
 ### 2. Gmail access
 
-1. In the [Google Cloud Console](https://console.cloud.google.com/), create a
-   project and enable the **Gmail API**.
-2. **APIs & Services → Credentials → Create credentials → OAuth client ID →
-   Desktop app**.
+Two separate steps in the Cloud console, and it's easy to do the second
+without the first:
+
+1. **Enable the Gmail API.** In the
+   [Google Cloud Console](https://console.cloud.google.com/), create a project,
+   then **APIs & Services → Library → Gmail API → Enable**. Creating OAuth
+   credentials does *not* enable the API — skip this and every call fails with
+   `403: Gmail API has not been used in project … before or it is disabled`.
+2. **Create an OAuth client.** **APIs & Services → Credentials → Create
+   credentials → OAuth client ID → Desktop app**. Desktop clients may redirect
+   to any loopback port, so there is nothing to configure.
+
+   > Using a **Web application** client instead? It only accepts redirect URIs
+   > you registered. Add `http://localhost:8080/` (exact, trailing slash),
+   > leave *Authorized JavaScript origins* empty, and keep
+   > `OAUTH_REDIRECT_PORT=8080` in `.env` so the two agree.
+
 3. Download the JSON and save it as `backend/credentials.json`.
 4. Authorise once (this opens a browser):
 
@@ -100,6 +119,15 @@ are gitignored.
 
 The scope is `gmail.readonly` — the agent never needs write access to your
 mailbox.
+
+**If something is wrong,** `GET /api/health` tells you which of the two steps
+failed rather than lumping them together:
+
+| `gmail_authorised` | `gmail_usable` | Meaning |
+|---|---|---|
+| `false` | `false` | No credentials — run `python -m app.gmail.auth` |
+| `true` | `false` | Credentials fine, the API call failed. Read `gmail_error` / `gmail_hint` — usually the Gmail API isn't enabled, and re-authorising will not help |
+| `true` | `true` | Working |
 
 ### 3. Frontend
 

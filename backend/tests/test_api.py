@@ -38,6 +38,7 @@ class TestHealth:
         assert body["status"] == "ok"
         # No credentials in the test environment.
         assert body["gmail_authorised"] is False
+        assert body["gmail_usable"] is False
         assert body["llm_calls"] == 0
         assert "emails_stored" in body
 
@@ -166,7 +167,8 @@ class TestSync:
     def test_backfill_is_refused_without_gmail_credentials(self, client):
         response = client.post("/api/sync/backfill", json={"days": 30})
         assert response.status_code == 409
-        assert "not authorised" in response.json()["detail"]
+        # The message must name the fix, not just the symptom.
+        assert "app.gmail.auth" in response.json()["detail"]
 
     def test_status_is_idle_before_any_run(self, client, db):
         assert client.get("/api/sync/status").json()["running"] is False

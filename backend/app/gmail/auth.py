@@ -6,7 +6,9 @@ Read-only scope. The agent never needs to modify the mailbox.
 from __future__ import annotations
 
 import logging
+import re
 import threading
+from dataclasses import dataclass
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -67,7 +69,7 @@ def load_credentials(*, allow_interactive: bool = True) -> Credentials:
         )
 
     flow = InstalledAppFlow.from_client_secrets_file(str(cred_file), SCOPES)
-    creds = flow.run_local_server(port=0, prompt="consent")
+    creds = flow.run_local_server(port=settings.oauth_redirect_port, prompt="consent")
     _persist(creds)
     return creds
 
@@ -77,6 +79,91 @@ def _persist(creds: Credentials) -> None:
     token_path.parent.mkdir(parents=True, exist_ok=True)
     token_path.write_text(creds.to_json(), encoding="utf-8")
     log.info("Saved Gmail token to %s", token_path)
+
+
+@dataclass
+class AccessStatus:
+    """Whether the agent can actually read mail, and why not if it can't.
+
+    Holding valid credentials and being able to call the API are different
+    things — the Gmail API has to be enabled on the Cloud project separately.
+    Collapsing both into one boolean sends people back through a consent flow
+    that cannot fix an API-not-enabled error.
+    """
+
+    authorised: bool
+    usable: bool
+    address: str | None = None
+    error: str | None = None
+    hint: str | None = None
+
+
+_CONSOLE_URL = re.compile(r"https://console\.(?:developers|cloud)\.google\.com/[^\s\"']+")
+
+
+def _extract_console_url(message: str) -> str | None:
+    """Pull the 'enable it here' link out of a Google API error.
+
+    Consumes greedily and trims trailing sentence punctuation afterwards —
+    stopping the match at the first `.` would cut the URL in half, since every
+    one of these contains `gmail.googleapis.com`.
+    """
+    match = _CONSOLE_URL.search(message)
+    if not match:
+        return None
+    return match.group(0).rstrip(".,);\\")
+
+AUTH_HINT = "Run `python -m app.gmail.auth` from the backend directory."
+
+
+def access_status() -> AccessStatus:
+    """Probe real access. Never triggers an interactive consent flow."""
+    try:
+        load_credentials(allow_interactive=False)
+    except GmailAuthError as exc:
+        return AccessStatus(False, False, error=str(exc), hint=AUTH_HINT)
+    except Exception as exc:  # noqa: BLE001 - a corrupt token lands here too
+        return AccessStatus(False, False, error=str(exc), hint=AUTH_HINT)
+
+    # Imported lazily: client imports this module, so a top-level import here
+    # would be circular.
+    from googleapiclient.errors import HttpError
+
+    from app.gmail import client as gmail_client
+
+    try:
+        profile = gmail_client.get_profile()
+    except HttpError as exc:
+        message = str(exc)
+        status = getattr(exc.resp, "status", None)
+
+        if status == 403 and "has not been used in project" in message:
+            url = _extract_console_url(message)
+            return AccessStatus(
+                True,
+                False,
+                error="The Gmail API is not enabled on this Google Cloud project.",
+                hint=(
+                    f"Enable it at {url} and retry in a minute."
+                    if url
+                    else "Enable the Gmail API in the Google Cloud console, then retry."
+                ),
+            )
+
+        if status in (401, 403):
+            return AccessStatus(
+                True,
+                False,
+                error=f"Gmail rejected the request ({status}). The token may be revoked or "
+                "missing the read-only scope.",
+                hint=AUTH_HINT,
+            )
+
+        return AccessStatus(True, False, error=f"Gmail API error: {message[:300]}")
+    except Exception as exc:  # noqa: BLE001 - network failures, DNS, proxies
+        return AccessStatus(True, False, error=f"Could not reach Gmail: {exc}")
+
+    return AccessStatus(True, True, address=profile.get("emailAddress"))
 
 
 def get_service(*, allow_interactive: bool = True):
@@ -102,8 +189,14 @@ def reset_service() -> None:
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    svc = get_service()
-    profile = svc.users().getProfile(userId="me").execute()
-    print(f"Authorised as {profile['emailAddress']}")
-    print(f"Messages in mailbox: {profile.get('messagesTotal')}")
-    print(f"Current historyId: {profile.get('historyId')}")
+    get_service()  # runs consent if needed
+
+    status = access_status()
+    if status.usable:
+        print(f"Authorised as {status.address}")
+    else:
+        print("Authorisation stored, but Gmail is not reachable yet.")
+        print(f"  {status.error}")
+        if status.hint:
+            print(f"  {status.hint}")
+        raise SystemExit(1)

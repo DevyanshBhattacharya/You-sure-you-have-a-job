@@ -15,8 +15,13 @@ export type Priority = "high" | "normal" | "low";
 
 export interface Health {
   status: string;
+  /** We hold credentials. */
   gmail_authorised: boolean;
+  /** We can actually call the API — false if e.g. the API isn't enabled. */
+  gmail_usable: boolean;
   gmail_address: string | null;
+  gmail_error: string | null;
+  gmail_hint: string | null;
   emails_stored: number;
   applications: number;
   watcher_running: boolean;

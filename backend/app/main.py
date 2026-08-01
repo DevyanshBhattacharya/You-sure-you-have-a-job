@@ -37,17 +37,16 @@ async def lifespan(_app: FastAPI):
     events.bind_loop(asyncio.get_running_loop())
     pipeline.start_workers()
 
-    # Only start the watcher if Gmail is already authorised — it must never
-    # pop a browser consent window from inside a server process.
-    try:
-        gmail_auth.load_credentials(allow_interactive=False)
+    # Only start the watcher once Gmail is genuinely reachable. access_status()
+    # never opens a consent window, which must never happen inside a server.
+    access = gmail_auth.access_status()
+    if access.usable:
+        log.info("Gmail ready as %s", access.address)
         watcher.start()
-    except Exception as exc:  # noqa: BLE001
-        log.warning(
-            "Gmail not authorised (%s). Run `python -m app.gmail.auth` from the "
-            "backend directory, then restart to enable the watcher.",
-            exc,
-        )
+    else:
+        log.warning("Gmail watcher not started: %s", access.error)
+        if access.hint:
+            log.warning("  %s", access.hint)
 
     try:
         yield

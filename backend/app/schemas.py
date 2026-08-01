@@ -69,8 +69,13 @@ class BackfillRequest(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str
+    # `authorised` = we hold credentials. `usable` = we can actually call the
+    # API. They differ when e.g. the Gmail API isn't enabled on the project.
     gmail_authorised: bool
+    gmail_usable: bool = False
     gmail_address: str | None = None
+    gmail_error: str | None = None
+    gmail_hint: str | None = None
     emails_stored: int
     applications: int
     watcher_running: bool

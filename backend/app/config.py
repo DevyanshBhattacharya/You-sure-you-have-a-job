@@ -27,6 +27,11 @@ class Settings(BaseSettings):
     # Gmail OAuth
     google_credentials_file: str = "credentials.json"
     google_token_file: str = "token.json"
+    # Loopback port for the consent flow. A "Desktop app" OAuth client accepts
+    # any port, but a "Web application" client only accepts the exact redirect
+    # URIs registered in the Cloud console — so this must match one of them
+    # (register `http://localhost:<port>/`, with the trailing slash).
+    oauth_redirect_port: int = 8080
 
     # Storage
     database_url: str = "sqlite:///./data/agent.db"

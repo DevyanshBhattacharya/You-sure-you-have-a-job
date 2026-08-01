@@ -12,7 +12,6 @@ from app import backfill, statestore
 from app.config import get_settings
 from app.db import get_db
 from app.gmail import auth as gmail_auth
-from app.gmail import client as gmail_client
 from app.models import Application, Email
 from app.schemas import BackfillRequest, HealthResponse, SyncStatus
 
@@ -24,20 +23,19 @@ router = APIRouter(prefix="/api", tags=["sync"])
 def health(db: Session = Depends(get_db)) -> HealthResponse:
     from app.gmail.watcher import is_running as watcher_running
 
-    gmail_ok = False
-    address: str | None = None
-    try:
-        # Never trigger a browser consent flow from an HTTP request.
-        gmail_auth.load_credentials(allow_interactive=False)
-        address = gmail_client.get_profile().get("emailAddress")
-        gmail_ok = True
-    except Exception as exc:  # noqa: BLE001
-        log.debug("Gmail not authorised: %s", exc)
+    # access_status never triggers a browser consent flow, so it is safe to
+    # call from an HTTP request.
+    access = gmail_auth.access_status()
+    if not access.usable:
+        log.debug("Gmail unavailable: %s", access.error)
 
     return HealthResponse(
         status="ok",
-        gmail_authorised=gmail_ok,
-        gmail_address=address,
+        gmail_authorised=access.authorised,
+        gmail_usable=access.usable,
+        gmail_address=access.address,
+        gmail_error=access.error,
+        gmail_hint=access.hint,
         emails_stored=db.scalar(select(func.count()).select_from(Email)) or 0,
         applications=db.scalar(select(func.count()).select_from(Application)) or 0,
         watcher_running=watcher_running(),
@@ -59,16 +57,14 @@ def start_backfill(payload: BackfillRequest | None = None) -> SyncStatus:
     settings = get_settings()
     days = (payload.days if payload and payload.days else None) or settings.backfill_default_days
 
-    try:
-        gmail_auth.load_credentials(allow_interactive=False)
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "Gmail is not authorised yet. Run `python -m app.gmail.auth` "
-                "from the backend directory to grant access."
-            ),
-        ) from exc
+    access = gmail_auth.access_status()
+    if not access.usable:
+        # Report the actual cause. Telling someone to re-run the consent flow
+        # when the real problem is a disabled API just wastes their time.
+        detail = access.error or "Gmail is not available."
+        if access.hint:
+            detail = f"{detail} {access.hint}"
+        raise HTTPException(status_code=409, detail=detail)
 
     if not backfill.start(days, on_email=submit_email_id):
         raise HTTPException(status_code=409, detail="A backfill is already running")
