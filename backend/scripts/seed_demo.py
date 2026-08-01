@@ -20,13 +20,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from sqlalchemy import select  # noqa: E402
+from sqlalchemy import func, select  # noqa: E402
 
 from app.agent.classify import Extraction, Verdict  # noqa: E402
 from app.agent.resolve import apply as apply_verdict  # noqa: E402
 from app.db import init_db, session_scope  # noqa: E402
 from app.kb import indexer  # noqa: E402
-from app.models import Email  # noqa: E402
+from app.models import Application, ApplicationEvent, Email  # noqa: E402
 
 PREFIX = "demo-"
 
@@ -177,11 +177,38 @@ def build_verdict(fields: dict) -> Verdict:
     )
 
 
-def clear(session) -> int:
+def clear(session) -> tuple[int, int]:
+    """Remove demo emails *and* the applications they created.
+
+    Deleting an Email cascades only to its ApplicationEvents — the Application
+    itself survives, so a naive clear leaves orphaned rows sitting on the board
+    forever. Collect the affected applications first, then drop any left with
+    no events.
+    """
     rows = session.scalars(select(Email).where(Email.gmail_id.like(f"{PREFIX}%"))).all()
+    touched = {
+        event.application_id for email in rows for event in email.events if event.application_id
+    }
+
     for row in rows:
         session.delete(row)
-    return len(rows)
+    session.flush()
+
+    removed_apps = 0
+    for application_id in touched:
+        application = session.get(Application, application_id)
+        if application is None:
+            continue
+        remaining = session.scalar(
+            select(func.count())
+            .select_from(ApplicationEvent)
+            .where(ApplicationEvent.application_id == application_id)
+        )
+        if not remaining:
+            session.delete(application)
+            removed_apps += 1
+
+    return len(rows), removed_apps
 
 
 def seed(session) -> int:
@@ -231,8 +258,8 @@ def main() -> int:
     init_db()
     with session_scope() as session:
         if args.clear:
-            removed = clear(session)
-            print(f"Removed {removed} demo email(s) and their applications.")
+            emails, applications = clear(session)
+            print(f"Removed {emails} demo email(s) and {applications} application(s).")
             return 0
 
         created = seed(session)

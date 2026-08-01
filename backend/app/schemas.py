@@ -61,6 +61,12 @@ class SyncStatus(BaseModel):
     done: int = 0
     error: str | None = None
     last_history_id: str | None = None
+    # LLM quota back-off. Deferred emails stay unprocessed and are retried on
+    # the next start rather than being classified with a degraded fallback.
+    quota_blocked: bool = False
+    quota_retry_in_seconds: int = 0
+    quota_reason: str = ""
+    quota_deferred: int = 0
 
 
 class BackfillRequest(BaseModel):
@@ -77,6 +83,7 @@ class HealthResponse(BaseModel):
     gmail_error: str | None = None
     gmail_hint: str | None = None
     emails_stored: int
+    emails_unprocessed: int = 0
     applications: int
     watcher_running: bool
     llm_calls: int

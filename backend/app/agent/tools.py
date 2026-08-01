@@ -12,10 +12,10 @@ from collections.abc import Callable
 from datetime import timedelta
 from typing import Any
 
-from google.genai import types
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.agent.providers.base import ToolSpec
 from app.kb import indexer
 from app.kb.store import hydrate_hits, store
 from app.models import Application, ApplicationEvent, ApplicationStatus, Email, utcnow
@@ -27,96 +27,91 @@ MAX_ROWS = 100
 
 # --------------------------------------------------------------------------
 # Declarations
+#
+# Plain JSON Schema, not a vendor type — each provider translates these into
+# its own dialect (Gemini FunctionDeclaration, Ollama's OpenAI-style array).
 # --------------------------------------------------------------------------
 
-FUNCTION_DECLARATIONS = [
-    types.FunctionDeclaration(
+TOOLS: list[ToolSpec] = [
+    ToolSpec(
         name="search_emails",
         description=(
             "Semantic search over the full text of job-related emails. Use for questions "
             "about what someone said, asked for, or wrote — anything needing the wording of "
             "a message rather than a count or a list."
         ),
-        parameters=types.Schema(
-            type=types.Type.OBJECT,
-            properties={
-                "query": types.Schema(
-                    type=types.Type.STRING,
-                    description="Natural-language description of what to find.",
-                ),
-                "k": types.Schema(
-                    type=types.Type.INTEGER,
-                    description="How many passages to return. Default 8, max 20.",
-                ),
-                "company": types.Schema(
-                    type=types.Type.STRING,
-                    description="Optional company name to restrict the search to.",
-                ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Natural-language description of what to find.",
+                },
+                "k": {
+                    "type": "integer",
+                    "description": "How many passages to return. Default 8, max 20.",
+                },
+                "company": {
+                    "type": "string",
+                    "description": "Optional company name to restrict the search to.",
+                },
             },
-            required=["query"],
-        ),
+            "required": ["query"],
+        },
     ),
-    types.FunctionDeclaration(
+    ToolSpec(
         name="list_applications",
         description=(
             "List tracked job applications with their current status. Use for counting, "
             "filtering, or enumerating applications."
         ),
-        parameters=types.Schema(
-            type=types.Type.OBJECT,
-            properties={
-                "status": types.Schema(
-                    type=types.Type.STRING,
-                    description=(
-                        "Optional status filter, one of: "
-                        + ", ".join(s.value for s in ApplicationStatus)
-                    ),
-                ),
-                "company": types.Schema(
-                    type=types.Type.STRING, description="Optional company substring filter."
-                ),
-                "days": types.Schema(
-                    type=types.Type.INTEGER,
-                    description="Optional: only applications active in the last N days.",
-                ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "status": {
+                    "type": "string",
+                    "description": "Optional status filter.",
+                    "enum": [s.value for s in ApplicationStatus],
+                },
+                "company": {"type": "string", "description": "Optional company substring filter."},
+                "days": {
+                    "type": "integer",
+                    "description": "Optional: only applications active in the last N days.",
+                },
             },
-        ),
+        },
     ),
-    types.FunctionDeclaration(
+    ToolSpec(
         name="get_application_timeline",
         description=(
             "Full chronological history of one application: every email event, what it was, "
             "and how the status changed. Call after list_applications to get the id."
         ),
-        parameters=types.Schema(
-            type=types.Type.OBJECT,
-            properties={
-                "application_id": types.Schema(
-                    type=types.Type.INTEGER, description="Application id."
-                ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "application_id": {"type": "integer", "description": "Application id."},
             },
-            required=["application_id"],
-        ),
+            "required": ["application_id"],
+        },
     ),
-    types.FunctionDeclaration(
+    ToolSpec(
         name="get_upcoming_actions",
         description=(
             "Pending things the user has to do, and their deadlines. Use for questions about "
             "what is due, what is scheduled, or what needs a response."
         ),
-        parameters=types.Schema(
-            type=types.Type.OBJECT,
-            properties={
-                "days": types.Schema(
-                    type=types.Type.INTEGER,
-                    description="Look-ahead window in days. Default 14.",
-                ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "days": {
+                    "type": "integer",
+                    "description": "Look-ahead window in days. Default 14.",
+                },
             },
-        ),
+        },
     ),
 ]
-
-TOOLS = [types.Tool(function_declarations=FUNCTION_DECLARATIONS)]
 
 
 # --------------------------------------------------------------------------

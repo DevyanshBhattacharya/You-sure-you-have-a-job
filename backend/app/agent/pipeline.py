@@ -13,11 +13,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 from sqlalchemy.orm import Session
 
 from app import ingest
 from app.agent import classify as classify_mod
+from app.agent import llm
 from app.agent import resolve as resolve_mod
 from app.db import session_scope
 from app.events import (
@@ -49,6 +51,59 @@ def submit_email_id(email_id: int, *, reclassify: bool = False) -> None:
 
 def submit_gmail_id(gmail_id: str) -> None:
     work_queue.submit_threadsafe(EmailWork(gmail_id=gmail_id))
+
+
+def count_unprocessed() -> int:
+    from sqlalchemy import func, select
+
+    with session_scope() as session:
+        return (
+            session.scalar(
+                select(func.count()).select_from(Email).where(Email.processed_at.is_(None))
+            )
+            or 0
+        )
+
+
+def enqueue_unprocessed(limit: int = 1000) -> int:
+    """Queue stored-but-unclassified mail. Returns how many were queued.
+
+    The work queue lives in memory, so anything in flight when the process
+    stops is lost — a backfill interrupted halfway leaves rows stranded with
+    `processed_at IS NULL` and nothing to pick them up again. Sweeping for
+    those on startup makes the pipeline recoverable rather than best-effort.
+    """
+    from sqlalchemy import select
+
+    from app.agent import prefilter
+
+    with session_scope() as session:
+        rows = list(
+            session.scalars(
+                select(Email)
+                .where(Email.processed_at.is_(None))
+                .order_by(Email.received_at.desc().nullslast())
+            ).all()
+        )
+
+        # Spend the day's quota on the most promising mail first. Free Gemini
+        # tiers allow only a handful of calls per day, so draining a large
+        # backlog in arrival order would burn the entire allowance on
+        # newsletters before reaching a single interview invite.
+        rows.sort(
+            key=lambda e: (
+                not prefilter.has_job_signal(e),
+                -(e.received_at.timestamp() if e.received_at else 0),
+            )
+        )
+        ids = [e.id for e in rows[:limit]]
+
+    for email_id in ids:
+        submit_email_id(email_id)
+
+    if ids:
+        log.info("Queued %d unprocessed email(s) for classification", len(ids))
+    return len(ids)
 
 
 # --------------------------------------------------------------------------
@@ -88,18 +143,58 @@ async def stop_workers() -> None:
     log.info("Pipeline workers stopped")
 
 
+# Set when the API reports exhausted quota. Until it clears, workers drain the
+# queue without doing work — the emails stay unprocessed in the database and
+# are re-queued on the next start, so nothing is lost by dropping them here.
+_quota_blocked_until: float = 0.0
+_quota_reason: str = ""
+_quota_deferred: int = 0
+
+
+def quota_state() -> dict:
+    remaining = max(0.0, _quota_blocked_until - time.monotonic())
+    return {
+        "blocked": remaining > 0,
+        "retry_in_seconds": int(remaining),
+        "reason": _quota_reason if remaining > 0 else "",
+        "deferred": _quota_deferred,
+    }
+
+
+def _note_quota_block(exc: llm.DeferWorkError) -> None:
+    global _quota_blocked_until, _quota_reason, _quota_deferred
+    # No stated delay means a per-day quota; back off for an hour and let the
+    # startup sweep pick things up later.
+    wait = exc.retry_after if exc.retry_after else 3600.0
+    _quota_blocked_until = max(_quota_blocked_until, time.monotonic() + wait)
+    _quota_reason = str(exc)
+    _quota_deferred = 0
+    log.error("LLM unavailable (%s). Deferring classification for %.0fs.", exc, wait)
+
+
 async def _worker(index: int) -> None:
+    global _quota_deferred
     while True:
         item = await work_queue.get()
         try:
+            if time.monotonic() < _quota_blocked_until:
+                _quota_deferred += 1
+                continue  # left unprocessed on purpose; re-queued next start
+
             result = await asyncio.to_thread(process_work, item)
             if result:
                 _publish(result)
         except asyncio.CancelledError:
             raise
+        except llm.DeferWorkError as exc:
+            _note_quota_block(exc)
+            _quota_deferred += 1
         except Exception:  # noqa: BLE001 - one bad email must not kill the worker
             log.exception("Worker %d failed on %r", index, item)
         finally:
+            # Outside the item's transaction, so the counter write cannot
+            # deadlock against it on SQLite.
+            await asyncio.to_thread(llm.flush_usage)
             work_queue.task_done()
 
 

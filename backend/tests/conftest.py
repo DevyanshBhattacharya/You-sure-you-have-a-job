@@ -20,6 +20,14 @@ os.environ["GEMINI_API_KEY"] = ""  # force the no-LLM paths unless a test patche
 os.environ["GOOGLE_CREDENTIALS_FILE"] = str(_TMP_DIR / "credentials.json")
 os.environ["GOOGLE_TOKEN_FILE"] = str(_TMP_DIR / "token.json")
 
+# Pin the backend too. Without this the suite inherits whatever LLM_PROVIDER a
+# developer happens to have in .env, so switching to Ollama locally would make
+# unrelated tests hang on connection timeouts and change their expectations.
+# Tests that exercise a specific provider set it themselves.
+os.environ["LLM_PROVIDER"] = "gemini"
+os.environ["OLLAMA_BASE_URL"] = "http://127.0.0.1:1"  # unroutable; never dialled
+os.environ["OLLAMA_TIMEOUT_SECONDS"] = "2"
+
 from app.db import SessionLocal, engine, init_db  # noqa: E402
 from app.kb.store import store  # noqa: E402
 from app.models import Base  # noqa: E402

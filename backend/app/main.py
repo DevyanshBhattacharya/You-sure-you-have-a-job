@@ -39,6 +39,18 @@ async def lifespan(_app: FastAPI):
 
     # Only start the watcher once Gmail is genuinely reachable. access_status()
     # never opens a consent window, which must never happen inside a server.
+    # Pick up anything a previous run stored but never classified.
+    backlog = pipeline.count_unprocessed()
+    if backlog:
+        if settings.process_backlog_on_start:
+            pipeline.enqueue_unprocessed(settings.backlog_batch_limit)
+        else:
+            log.warning(
+                "%d email(s) are stored but unclassified. PROCESS_BACKLOG_ON_START is off; "
+                "run scripts/replay.py --only-unprocessed to handle them.",
+                backlog,
+            )
+
     access = gmail_auth.access_status()
     if access.usable:
         log.info("Gmail ready as %s", access.address)

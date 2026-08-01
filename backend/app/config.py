@@ -17,12 +17,24 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    # Which backend to use: "gemini" (hosted) or "ollama" (local).
+    llm_provider: str = "gemini"
+
     # Gemini
     gemini_api_key: str = ""
     classifier_model: str = "gemini-2.5-flash"
     qa_model: str = "gemini-2.5-pro"
     embedding_model: str = "gemini-embedding-001"
     embedding_dim: int = 1536
+
+    # Ollama (local; no key, no quota)
+    ollama_base_url: str = "http://localhost:11434"
+    ollama_model: str = "qwen3:4b"
+    # Falls back to ollama_model when blank.
+    ollama_qa_model: str = ""
+    ollama_embedding_model: str = "nomic-embed-text"
+    # Local inference on CPU is slow; a per-request minute is not unusual.
+    ollama_timeout_seconds: float = 300.0
 
     # Gmail OAuth
     google_credentials_file: str = "credentials.json"
@@ -39,6 +51,12 @@ class Settings(BaseSettings):
     # Watcher
     poll_interval_seconds: int = 60
     backfill_default_days: int = 90
+
+    # On startup, re-queue mail that was stored but never classified (e.g. the
+    # process stopped mid-backfill). Costs one classifier call per email, so it
+    # can be turned off if a large backlog would be an unwelcome surprise.
+    process_backlog_on_start: bool = True
+    backlog_batch_limit: int = 1000
 
     # Server
     cors_origins: str = "http://localhost:5173"

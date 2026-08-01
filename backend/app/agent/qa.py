@@ -2,20 +2,30 @@
 
 A tool-calling loop rather than plain RAG: the model decides whether a question
 needs the text of an email, a structured query, or both.
+
+Provider-neutral — the loop speaks in `Turn`/`ToolCall`, and the configured
+backend translates. That is what lets the same code run against hosted Gemini
+or a local Ollama model.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-from google.genai import types
 from sqlalchemy.orm import Session
 
 from app.agent import llm, tools
-from app.config import get_settings
+from app.agent.providers.base import (
+    DeferWorkError,
+    TextChunk,
+    ToolCall,
+    ToolCallsChunk,
+    Turn,
+)
 
 log = logging.getLogger(__name__)
 
@@ -40,8 +50,6 @@ Style:
 - Lead with the direct answer, then the supporting detail.
 - Be concrete: real company names, real dates, real numbers.
 - Keep it brief. No preamble, no restating the question.
-- Dates in the user's terms ("last Tuesday", "in three days") only when the \
-  relative framing is what they asked about; otherwise give the actual date.
 """
 
 
@@ -57,15 +65,15 @@ def _system_instruction() -> str:
     return f"{SYSTEM_INSTRUCTION}\nThe current date and time is {now}."
 
 
-def _to_contents(history: list[dict], message: str) -> list[types.Content]:
-    contents: list[types.Content] = []
-    for turn in history[-12:]:  # keep the prompt bounded
-        role = "model" if turn.get("role") == "model" else "user"
-        text = (turn.get("content") or "").strip()
+def _to_turns(history: list[dict], message: str) -> list[Turn]:
+    turns: list[Turn] = []
+    for entry in history[-12:]:  # keep the prompt bounded
+        role = "assistant" if entry.get("role") in ("model", "assistant") else "user"
+        text = (entry.get("content") or "").strip()
         if text:
-            contents.append(types.Content(role=role, parts=[types.Part(text=text)]))
-    contents.append(types.Content(role="user", parts=[types.Part(text=message)]))
-    return contents
+            turns.append(Turn(role=role, text=text))
+    turns.append(Turn(role="user", text=message))
+    return turns
 
 
 def _collect_citations(name: str, result: dict, sink: list[dict], seen: set[tuple]) -> None:
@@ -87,7 +95,7 @@ def _collect_citations(name: str, result: dict, sink: list[dict], seen: set[tupl
     elif name in ("list_applications", "get_upcoming_actions", "get_application_timeline"):
         rows: list[dict] = []
         if "applications" in result:
-            rows = result["applications"]
+            rows = list(result["applications"])
         elif "application" in result:
             rows = [result["application"]]
         rows += result.get("with_deadline", []) + result.get("without_deadline", [])
@@ -107,16 +115,6 @@ def _collect_citations(name: str, result: dict, sink: list[dict], seen: set[tupl
                 )
 
 
-def _config() -> types.GenerateContentConfig:
-    return types.GenerateContentConfig(
-        system_instruction=_system_instruction(),
-        tools=tools.TOOLS,
-        # Our tools need a DB session, so they're dispatched by hand below.
-        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-        temperature=0.2,
-    )
-
-
 def stream_answer(
     session: Session, message: str, history: list[dict] | None = None
 ) -> Iterator[dict]:
@@ -132,81 +130,61 @@ def stream_answer(
         yield {
             "type": "error",
             "message": (
-                "GEMINI_API_KEY is not set, so the assistant can't answer questions. "
-                "Add a key to backend/.env and restart."
+                "No LLM backend is configured. Set LLM_PROVIDER=ollama for local "
+                "inference, or add GEMINI_API_KEY to backend/.env."
             ),
         }
         return
 
-    settings = get_settings()
-    client = llm.get_client()
-    contents = _to_contents(history or [], message)
-    config = _config()
-
+    turns = _to_turns(history or [], message)
     citations: list[dict] = []
     seen: set[tuple] = set()
     called: list[str] = []
     answered = False
 
     for round_index in range(MAX_TOOL_ROUNDS):
+        pending: list[ToolCall] = []
+        text_parts: list[str] = []
+
         try:
-            stream = client.models.generate_content_stream(
-                model=settings.qa_model, contents=contents, config=config
-            )
+            for event in llm.stream_turn(
+                system=_system_instruction(), turns=turns, tools=tools.TOOLS
+            ):
+                if isinstance(event, TextChunk):
+                    text_parts.append(event.text)
+                    answered = True
+                    yield {"type": "token", "text": event.text}
+                elif isinstance(event, ToolCallsChunk):
+                    pending.extend(event.calls)
+        except DeferWorkError as exc:
+            yield {"type": "error", "message": f"The model is unavailable right now: {exc}"}
+            return
         except Exception as exc:  # noqa: BLE001
             log.exception("Q&A request failed")
             yield {"type": "error", "message": f"Model request failed: {exc}"}
             return
 
-        function_calls: list[types.FunctionCall] = []
-        model_parts: list[types.Part] = []
-        text_buffer: list[str] = []
-        usage = llm.Usage()
-
-        try:
-            for piece in stream:
-                if getattr(piece, "usage_metadata", None) is not None:
-                    usage = llm.usage_from(piece)
-
-                candidates = getattr(piece, "candidates", None) or []
-                if not candidates:
-                    continue
-                content = getattr(candidates[0], "content", None)
-                for part in getattr(content, "parts", None) or []:
-                    if getattr(part, "function_call", None):
-                        function_calls.append(part.function_call)
-                        model_parts.append(part)
-                    elif getattr(part, "text", None):
-                        text_buffer.append(part.text)
-                        model_parts.append(part)
-                        yield {"type": "token", "text": part.text}
-                        answered = True
-        except Exception as exc:  # noqa: BLE001
-            log.exception("Q&A stream failed")
-            yield {"type": "error", "message": f"Stream failed: {exc}"}
-            return
-        finally:
-            llm.record_usage(usage)
-
-        if not function_calls:
+        if not pending:
             break
 
-        contents.append(types.Content(role="model", parts=model_parts))
+        turns.append(
+            Turn(role="assistant", text="".join(text_parts) or None, tool_calls=list(pending))
+        )
 
-        response_parts: list[types.Part] = []
-        for call in function_calls:
-            name = call.name or ""
-            args = dict(call.args or {})
-            called.append(name)
-            yield {"type": "tool", "name": name, "args": args}
+        for call in pending:
+            called.append(call.name)
+            yield {"type": "tool", "name": call.name, "args": call.arguments}
 
-            result = tools.dispatch(session, name, args)
-            _collect_citations(name, result, citations, seen)
-            response_parts.append(
-                types.Part.from_function_response(name=name, response={"result": result})
+            result = tools.dispatch(session, call.name, call.arguments)
+            _collect_citations(call.name, result, citations, seen)
+            turns.append(
+                Turn(
+                    role="tool",
+                    text=json.dumps(result, default=str),
+                    tool_call_id=call.id,
+                    tool_name=call.name,
+                )
             )
-
-        contents.append(types.Content(role="user", parts=response_parts))
 
         if round_index == MAX_TOOL_ROUNDS - 1:
             yield {

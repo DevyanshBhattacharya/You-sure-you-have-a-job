@@ -152,8 +152,16 @@ def classify(session: Session, email: Email) -> Verdict:
             system_instruction=SYSTEM_INSTRUCTION,
             model=settings.classifier_model,
         )
+    except llm.DeferWorkError:
+        # Quota exhausted, or the backend is unreachable (Ollama not running).
+        # Deliberately NOT downgraded to a heuristic guess: that would mark the
+        # email processed and permanently freeze a low-confidence verdict built
+        # from the sender's name. Both conditions are systemic, so the fallback
+        # would burn the whole backlog before anyone noticed. Propagating
+        # leaves the email unprocessed, to be retried later.
+        raise
     except Exception as exc:  # noqa: BLE001 - never lose an email to an API blip
-        log.exception("Classification failed for email %s", email.id)
+        log.warning("Classification failed for email %s: %s", email.id, str(exc)[:200])
         signal = prefilter.has_job_signal(email)
         return Verdict(
             is_job_related=signal,

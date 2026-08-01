@@ -31,9 +31,14 @@ def is_running() -> bool:
 
 def status() -> dict:
     with session_scope() as session:
+        state = statestore.get(session, BACKFILL_STATUS, "idle")
+        # A process that died mid-import leaves "listing"/"fetching" behind
+        # forever, which reads as though work is still happening.
+        if not is_running() and state in ("listing", "fetching"):
+            state = "interrupted"
         return {
             "running": is_running(),
-            "status": statestore.get(session, BACKFILL_STATUS, "idle"),
+            "status": state,
             "total": statestore.get_int(session, BACKFILL_TOTAL),
             "done": statestore.get_int(session, BACKFILL_DONE),
             "error": statestore.get(session, BACKFILL_ERROR),

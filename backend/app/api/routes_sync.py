@@ -21,7 +21,12 @@ router = APIRouter(prefix="/api", tags=["sync"])
 
 @router.get("/health", response_model=HealthResponse)
 def health(db: Session = Depends(get_db)) -> HealthResponse:
+    from app.agent import llm
     from app.gmail.watcher import is_running as watcher_running
+
+    # Token counters are buffered in memory by the pipeline; settle them before
+    # reporting so /api/health never shows a stale total.
+    llm.flush_usage()
 
     # access_status never triggers a browser consent flow, so it is safe to
     # call from an HTTP request.
@@ -37,6 +42,10 @@ def health(db: Session = Depends(get_db)) -> HealthResponse:
         gmail_error=access.error,
         gmail_hint=access.hint,
         emails_stored=db.scalar(select(func.count()).select_from(Email)) or 0,
+        emails_unprocessed=db.scalar(
+            select(func.count()).select_from(Email).where(Email.processed_at.is_(None))
+        )
+        or 0,
         applications=db.scalar(select(func.count()).select_from(Application)) or 0,
         watcher_running=watcher_running(),
         llm_calls=statestore.get_int(db, statestore.LLM_CALLS),
@@ -47,7 +56,16 @@ def health(db: Session = Depends(get_db)) -> HealthResponse:
 
 @router.get("/sync/status", response_model=SyncStatus)
 def sync_status() -> SyncStatus:
-    return SyncStatus(**backfill.status())
+    from app.agent.pipeline import quota_state
+
+    quota = quota_state()
+    return SyncStatus(
+        **backfill.status(),
+        quota_blocked=quota["blocked"],
+        quota_retry_in_seconds=quota["retry_in_seconds"],
+        quota_reason=quota["reason"],
+        quota_deferred=quota["deferred"],
+    )
 
 
 @router.post("/sync/backfill", response_model=SyncStatus, status_code=202)

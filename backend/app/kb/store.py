@@ -59,61 +59,50 @@ class NumpyVectorStore:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._ids: np.ndarray | None = None
-        self._matrix: np.ndarray | None = None
-        self._row_count: int | None = None
+        # Cached per embedding dimension: switching provider (Gemini 1536 ->
+        # nomic-embed-text 768) leaves both generations in the table, and only
+        # vectors matching the query's dimension are comparable.
+        self._cache: dict[int, tuple[np.ndarray, np.ndarray, int]] = {}
 
     def invalidate(self) -> None:
         with self._lock:
-            self._ids = None
-            self._matrix = None
-            self._row_count = None
+            self._cache.clear()
 
-    def _load(self, session: Session) -> tuple[np.ndarray, np.ndarray] | None:
-        current = session.scalar(
-            select(func.count()).select_from(KBChunk).where(KBChunk.embedding.is_not(None))
+    def _load(self, session: Session, dim: int) -> tuple[np.ndarray, np.ndarray] | None:
+        current = (
+            session.scalar(
+                select(func.count())
+                .select_from(KBChunk)
+                .where(KBChunk.embedding.is_not(None), KBChunk.dim == dim)
+            )
+            or 0
         )
-        with self._lock:
-            if self._matrix is not None and self._row_count == current:
-                return self._ids, self._matrix
 
-        rows = session.execute(
-            select(KBChunk.id, KBChunk.embedding).where(KBChunk.embedding.is_not(None))
-        ).all()
-        if not rows:
+        with self._lock:
+            cached = self._cache.get(dim)
+            if cached is not None and cached[2] == current:
+                return cached[0], cached[1]
+
+        if current == 0:
             with self._lock:
-                self._ids = None
-                self._matrix = None
-                self._row_count = 0
+                self._cache.pop(dim, None)
             return None
 
-        vectors = [from_blob(blob) for _, blob in rows]
-        width = max(v.shape[0] for v in vectors)
-        # Guard against a dimension change mid-corpus (e.g. EMBEDDING_DIM edited).
-        usable = [
-            (cid, v)
-            for (cid, _), v in zip(rows, vectors, strict=True)
-            if v.shape[0] == width
-        ]
-        if len(usable) != len(rows):
-            log.warning(
-                "Ignoring %d chunk(s) whose embedding dimension differs from %d; "
-                "re-index to include them",
-                len(rows) - len(usable),
-                width,
+        rows = session.execute(
+            select(KBChunk.id, KBChunk.embedding).where(
+                KBChunk.embedding.is_not(None), KBChunk.dim == dim
             )
+        ).all()
 
-        ids = np.array([cid for cid, _ in usable], dtype=np.int64)
-        matrix = np.vstack([v for _, v in usable]).astype(np.float32)
+        ids = np.array([cid for cid, _ in rows], dtype=np.int64)
+        matrix = np.vstack([from_blob(blob) for _, blob in rows]).astype(np.float32)
 
         norms = np.linalg.norm(matrix, axis=1, keepdims=True)
         norms[norms == 0] = 1.0
         matrix = matrix / norms
 
         with self._lock:
-            self._ids = ids
-            self._matrix = matrix
-            self._row_count = current
+            self._cache[dim] = (ids, matrix, current)
         return ids, matrix
 
     def search(
@@ -124,19 +113,19 @@ class NumpyVectorStore:
         k: int = 8,
         application_id: int | None = None,
     ) -> list[SearchHit]:
-        loaded = self._load(session)
-        if loaded is None:
-            return []
-        ids, matrix = loaded
-
         query = np.asarray(query_vector, dtype=np.float32)
-        if query.shape[0] != matrix.shape[1]:
+        if query.size == 0:
+            return []
+
+        loaded = self._load(session, int(query.shape[0]))
+        if loaded is None:
             log.warning(
-                "Query dimension %d does not match index dimension %d; no results",
+                "No %d-dimension embeddings indexed. If the embedding model changed, "
+                "re-index with scripts/reindex_kb.py",
                 query.shape[0],
-                matrix.shape[1],
             )
             return []
+        ids, matrix = loaded
 
         norm = np.linalg.norm(query)
         if norm == 0:

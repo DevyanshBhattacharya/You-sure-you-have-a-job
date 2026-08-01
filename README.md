@@ -7,7 +7,8 @@ answers questions about the job search from its own knowledge base.
 - **Backend** — Python, FastAPI, SQLite
 - **Frontend** — React, Vite, TypeScript, Tailwind
 - **Mail** — Gmail API (read-only OAuth)
-- **LLM** — Google Gemini (`google-genai`)
+- **LLM** — pluggable: Google Gemini (hosted) or Ollama (local), set by
+  `LLM_PROVIDER`
 
 ---
 
@@ -60,15 +61,47 @@ python -m venv .venv
 Copy-Item .env.example .env
 ```
 
-Then edit `backend/.env`:
+Then edit `backend/.env`. `LLM_PROVIDER` picks the backend:
 
-| Variable | What it's for |
-|---|---|
-| `GEMINI_API_KEY` | Get one at <https://aistudio.google.com/apikey> |
-| `CLASSIFIER_MODEL` | Per-email extraction. A fast/cheap model is the right choice here. |
-| `QA_MODEL` | Dashboard Q&A. Worth a stronger model. |
-| `EMBEDDING_MODEL` | Knowledge-base embeddings |
-| `POLL_INTERVAL_SECONDS` | How often the watcher checks for new mail |
+**Option A — Ollama (local).** No key, no quota, no bill. Slower, and the
+answers are only as good as what your machine can run. This is the practical
+choice while the Gemini free tier is in the way.
+
+```powershell
+winget install Ollama.Ollama      # or https://ollama.com/download
+ollama serve                      # leave running in its own terminal
+ollama pull qwen3:4b              # classifier + Q&A  (~2.6 GB, supports tools)
+ollama pull nomic-embed-text      # embeddings        (~275 MB)
+```
+
+```ini
+LLM_PROVIDER=ollama
+OLLAMA_MODEL=qwen3:4b
+OLLAMA_EMBEDDING_MODEL=nomic-embed-text
+```
+
+**Option B — Gemini (hosted).** Better quality, but read the free-tier warning
+below before starting a backfill.
+
+```ini
+LLM_PROVIDER=gemini
+GEMINI_API_KEY=...                # https://aistudio.google.com/apikey
+CLASSIFIER_MODEL=gemini-3.5-flash-lite
+QA_MODEL=gemini-3.6-flash
+EMBEDDING_MODEL=gemini-embedding-001
+```
+
+Other settings: `POLL_INTERVAL_SECONDS` (how often the watcher checks for new
+mail) and `PROCESS_BACKLOG_ON_START` (re-queue stored-but-unclassified mail at
+startup).
+
+> **Switching providers changes the embedding dimension** (Gemini 1536 vs
+> nomic-embed-text 768). Vectors of different sizes aren't comparable, so the
+> store only searches ones matching the current model. Rebuild the old ones:
+>
+> ```powershell
+> .\.venv\Scripts\python.exe scripts\reindex_kb.py
+> ```
 
 > **Verify your models before the first run.** Availability varies by key and
 > tier — some models are withdrawn from new keys, and Pro models often have no
@@ -191,12 +224,39 @@ Manual corrections made in the **Inbox** tab are stored with
 
 ---
 
-## Cost
+## Cost and the free-tier ceiling
 
 Token usage is accumulated per call and reported on `/api/health`
 (`llm_calls`, `prompt_tokens`, `output_tokens`), so a runaway backfill shows up
 immediately rather than on the bill. The prefilter drops obvious non-job mail
 before any model call.
+
+> ⚠️ **The Gemini free tier is measured per day, and it is small.** Observed
+> limits: `gemini-3.6-flash` **20 requests/day**, `gemini-3.5-flash-lite`
+> **15/day**, `gemini-2.0-flash` **0** (no free quota). That is nowhere near
+> enough to classify a real inbox — a few hundred emails would take weeks.
+>
+> Two ways out: **enable billing** on the Cloud project (Flash-Lite is cheap
+> enough that a few hundred emails costs a few cents), or run
+> **`LLM_PROVIDER=ollama`** locally, where there is no quota at all.
+
+The pipeline is built for this constraint rather than defeated by it:
+
+- A quota error (`429`) or an unreachable backend (Ollama not running)
+  **never** produces a fabricated verdict. The email is left with
+  `processed_at = NULL` and retried on the next start — degrading to a guess
+  would freeze a low-confidence result derived from the sender's name, and
+  nothing re-examines processed mail. Both conditions are systemic, so a
+  fallback would corrupt the entire backlog rather than one message.
+- Once quota is exhausted the pipeline **stops calling the API** for the stated
+  retry window (an hour if the limit is per-day) instead of hammering it.
+  `/api/sync/status` exposes `quota_blocked`, `quota_retry_in_seconds` and
+  `quota_deferred`.
+- The startup sweep queues **job-signal mail first**, so a small daily
+  allowance is spent on likely interview invites rather than on newsletters
+  that happen to be newer.
+
+`GET /api/health` reports `emails_unprocessed` so a stalled backlog is visible.
 
 ---
 
@@ -227,12 +287,15 @@ credentials or an API key.
 backend/
   app/
     gmail/      auth, API client, MIME normalisation, watcher
-    agent/      llm, prefilter, classify, resolve, pipeline, tools, qa
+    agent/
+      providers/  base (the seam), gemini, ollama
+      llm.py      facade over the selected provider
+      prefilter, classify, resolve, pipeline, tools, qa
     kb/         chunking, embeddings, vector store, indexer
     api/        HTTP + WebSocket routes
     events.py   work queue + event bus
     models.py   ORM and domain enums
-  scripts/      replay.py, seed_demo.py
+  scripts/      check_models.py, replay.py, reindex_kb.py, seed_demo.py
   tests/
 frontend/
   src/
