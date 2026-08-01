@@ -1,0 +1,222 @@
+"""Vector storage and search.
+
+Embeddings live as float32 BLOBs on `kb_chunks`; search is brute-force cosine
+over an in-memory matrix. For a personal mailbox (tens of thousands of chunks)
+that is well under a millisecond per query and needs no native extension.
+
+`VectorStore` is the seam: swapping in sqlite-vec or a dedicated index later
+means implementing this interface, nothing more.
+"""
+
+from __future__ import annotations
+
+import logging
+import threading
+from dataclasses import dataclass
+from typing import Protocol
+
+import numpy as np
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
+
+from app.models import Application, Email, KBChunk
+
+log = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class SearchHit:
+    chunk_id: int
+    email_id: int | None
+    application_id: int | None
+    text: str
+    score: float
+
+
+class VectorStore(Protocol):
+    def search(
+        self,
+        session: Session,
+        query_vector: list[float],
+        *,
+        k: int = 8,
+        application_id: int | None = None,
+    ) -> list[SearchHit]: ...
+
+    def invalidate(self) -> None: ...
+
+
+def to_blob(vector: list[float]) -> bytes:
+    return np.asarray(vector, dtype=np.float32).tobytes()
+
+
+def from_blob(blob: bytes) -> np.ndarray:
+    return np.frombuffer(blob, dtype=np.float32)
+
+
+class NumpyVectorStore:
+    """Brute-force cosine search with a lazily-built, cached matrix."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._ids: np.ndarray | None = None
+        self._matrix: np.ndarray | None = None
+        self._row_count: int | None = None
+
+    def invalidate(self) -> None:
+        with self._lock:
+            self._ids = None
+            self._matrix = None
+            self._row_count = None
+
+    def _load(self, session: Session) -> tuple[np.ndarray, np.ndarray] | None:
+        current = session.scalar(
+            select(func.count()).select_from(KBChunk).where(KBChunk.embedding.is_not(None))
+        )
+        with self._lock:
+            if self._matrix is not None and self._row_count == current:
+                return self._ids, self._matrix
+
+        rows = session.execute(
+            select(KBChunk.id, KBChunk.embedding).where(KBChunk.embedding.is_not(None))
+        ).all()
+        if not rows:
+            with self._lock:
+                self._ids = None
+                self._matrix = None
+                self._row_count = 0
+            return None
+
+        vectors = [from_blob(blob) for _, blob in rows]
+        width = max(v.shape[0] for v in vectors)
+        # Guard against a dimension change mid-corpus (e.g. EMBEDDING_DIM edited).
+        usable = [
+            (cid, v)
+            for (cid, _), v in zip(rows, vectors, strict=True)
+            if v.shape[0] == width
+        ]
+        if len(usable) != len(rows):
+            log.warning(
+                "Ignoring %d chunk(s) whose embedding dimension differs from %d; "
+                "re-index to include them",
+                len(rows) - len(usable),
+                width,
+            )
+
+        ids = np.array([cid for cid, _ in usable], dtype=np.int64)
+        matrix = np.vstack([v for _, v in usable]).astype(np.float32)
+
+        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        matrix = matrix / norms
+
+        with self._lock:
+            self._ids = ids
+            self._matrix = matrix
+            self._row_count = current
+        return ids, matrix
+
+    def search(
+        self,
+        session: Session,
+        query_vector: list[float],
+        *,
+        k: int = 8,
+        application_id: int | None = None,
+    ) -> list[SearchHit]:
+        loaded = self._load(session)
+        if loaded is None:
+            return []
+        ids, matrix = loaded
+
+        query = np.asarray(query_vector, dtype=np.float32)
+        if query.shape[0] != matrix.shape[1]:
+            log.warning(
+                "Query dimension %d does not match index dimension %d; no results",
+                query.shape[0],
+                matrix.shape[1],
+            )
+            return []
+
+        norm = np.linalg.norm(query)
+        if norm == 0:
+            return []
+        query = query / norm
+
+        scores = matrix @ query
+
+        # Over-fetch when filtering, since the filter is applied after scoring.
+        fetch = min(len(scores), k * 10 if application_id is not None else k)
+        top = np.argpartition(-scores, min(fetch - 1, len(scores) - 1))[:fetch]
+        top = top[np.argsort(-scores[top])]
+
+        candidate_ids = [int(ids[i]) for i in top]
+        score_by_id = {int(ids[i]): float(scores[i]) for i in top}
+
+        stmt = select(KBChunk).where(KBChunk.id.in_(candidate_ids))
+        if application_id is not None:
+            stmt = stmt.where(KBChunk.application_id == application_id)
+        chunks = {c.id: c for c in session.scalars(stmt).all()}
+
+        hits: list[SearchHit] = []
+        for cid in candidate_ids:
+            chunk = chunks.get(cid)
+            if chunk is None:
+                continue
+            hits.append(
+                SearchHit(
+                    chunk_id=chunk.id,
+                    email_id=chunk.email_id,
+                    application_id=chunk.application_id,
+                    text=chunk.text,
+                    score=score_by_id[cid],
+                )
+            )
+            if len(hits) >= k:
+                break
+        return hits
+
+
+store: VectorStore = NumpyVectorStore()
+
+
+def hydrate_hits(session: Session, hits: list[SearchHit]) -> list[dict]:
+    """Attach email and application context so answers can cite sources."""
+    email_ids = {h.email_id for h in hits if h.email_id}
+    app_ids = {h.application_id for h in hits if h.application_id}
+
+    emails = (
+        {e.id: e for e in session.scalars(select(Email).where(Email.id.in_(email_ids))).all()}
+        if email_ids
+        else {}
+    )
+    apps = (
+        {
+            a.id: a
+            for a in session.scalars(select(Application).where(Application.id.in_(app_ids))).all()
+        }
+        if app_ids
+        else {}
+    )
+
+    out: list[dict] = []
+    for hit in hits:
+        email = emails.get(hit.email_id) if hit.email_id else None
+        app = apps.get(hit.application_id) if hit.application_id else None
+        out.append(
+            {
+                "chunk_id": hit.chunk_id,
+                "score": round(hit.score, 4),
+                "text": hit.text,
+                "email_id": hit.email_id,
+                "subject": email.subject if email else None,
+                "from": email.from_addr if email else None,
+                "received_at": email.received_at.isoformat()
+                if email and email.received_at
+                else None,
+                "application_id": hit.application_id,
+                "company": app.company if app else None,
+                "role_title": app.role_title if app else None,
+            }
+        )
+    return out

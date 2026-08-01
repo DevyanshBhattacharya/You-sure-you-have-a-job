@@ -1,0 +1,40 @@
+# ---- Secrets: never commit ----
+.env
+.env.*
+!.env.example
+credentials.json
+token.json
+*.pem
+*.key
+
+# ---- Data ----
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+data/
+backend/data/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+
+# ---- Node ----
+node_modules/
+dist/
+.vite/
+*.local
+
+# ---- Editors / OS ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
