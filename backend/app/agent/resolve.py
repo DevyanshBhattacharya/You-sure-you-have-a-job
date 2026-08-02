@@ -328,6 +328,54 @@ def apply(
     return outcome
 
 
+def retract(session: Session, email: Email) -> list[int]:
+    """Undo what a previous, wrong verdict recorded for this email.
+
+    Re-classification can flip an email from job-related to not. Without this,
+    the timeline entry and the application built from the bad verdict survive
+    the correction, so a fixed classifier can never clean up after a broken one.
+
+    Returns the ids of applications deleted for having no events left.
+    """
+    events = list(
+        session.scalars(select(ApplicationEvent).where(ApplicationEvent.email_id == email.id)).all()
+    )
+    if not events:
+        return []
+
+    touched = {e.application_id for e in events}
+    for event in events:
+        session.delete(event)
+
+    # Notifications reference the email; a retracted event should not leave an
+    # alert about an interview that was never real.
+    stale_notes = session.scalars(
+        select(Notification).where(Notification.email_id == email.id)
+    ).all()
+    for note in stale_notes:
+        session.delete(note)
+
+    session.flush()
+
+    removed: list[int] = []
+    for application_id in touched:
+        remaining = session.scalar(
+            select(ApplicationEvent).where(ApplicationEvent.application_id == application_id)
+        )
+        if remaining is not None:
+            continue
+        # The application existed only because of this email.
+        app = session.get(Application, application_id)
+        if app is not None:
+            session.delete(app)
+            removed.append(application_id)
+
+    if removed:
+        log.info("Retracted email %s; removed %d empty application(s)", email.id, len(removed))
+    session.flush()
+    return removed
+
+
 def _as_status(value) -> ApplicationStatus:
     if isinstance(value, ApplicationStatus):
         return value

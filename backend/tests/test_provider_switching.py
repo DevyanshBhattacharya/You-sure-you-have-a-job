@@ -192,3 +192,60 @@ class TestEmbeddingDimensionIsolation:
         db.commit()
 
         assert NumpyVectorStore().search(db, [0.5] * 768, k=5) == []
+
+
+class TestModelSelectionFollowsTheProvider:
+    """Callers must not name a model; the provider resolves its own.
+
+    Regression: `classify` passed `settings.classifier_model` — a Gemini id —
+    to whichever backend was configured. Under Ollama every call failed with
+    "no model 'gemini-3.5-flash-lite'", was caught by the generic handler, and
+    silently degraded to a heuristic verdict. Classification looked like it was
+    running; nothing was ever classified by a model.
+    """
+
+    def test_classify_uses_the_ollama_model(self, db, use_ollama, monkeypatch):
+        seen: dict = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.update(json.loads(request.content))
+            return httpx.Response(
+                200,
+                json={
+                    "message": {"content": json.dumps(CLASSIFICATION)},
+                    "prompt_eval_count": 400,
+                    "eval_count": 60,
+                },
+            )
+
+        route(monkeypatch, handler)
+
+        from app.agent import classify
+
+        email = make_email(db, subject="Interview invitation", body="Please confirm a time.")
+        verdict = classify.classify(db, email)
+
+        assert seen["model"] == "qwen3:4b"
+        assert not seen["model"].startswith("gemini")
+        # The verdict came from the model, not the heuristic fallback.
+        assert verdict.source == "llm"
+        assert verdict.raw["company"] == "Northwind Labs"
+
+    def test_a_wrong_model_id_is_not_hidden_as_a_heuristic_verdict(
+        self, db, use_ollama, monkeypatch
+    ):
+        """A missing model is a configuration fault, and must be visible."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(404, json={"error": "model not found"})
+
+        route(monkeypatch, handler)
+
+        from app.agent import classify
+
+        email = make_email(db, subject="Interview invitation", body="Please confirm a time.")
+        verdict = classify.classify(db, email)
+
+        # It degrades rather than losing the email, but says so plainly.
+        assert verdict.source == "heuristic"
+        assert "ollama pull" in verdict.raw["error"]

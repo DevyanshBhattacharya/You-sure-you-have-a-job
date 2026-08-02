@@ -31,6 +31,44 @@ log = logging.getLogger(__name__)
 
 MAX_TOOL_ROUNDS = 6
 
+# Ceiling on how much of a tool result is handed back to the model, in
+# characters (~4 per token). Tool output grows with the mailbox, and a result
+# that overflows the context window pushes the system instruction and the
+# question out of it — the model then answers from the data alone, with no idea
+# what was asked. Better to feed less and say so.
+MAX_TOOL_RESULT_CHARS = 12_000
+
+# Lists that can be shortened without changing what an aggregate question means.
+_TRIMMABLE = ("applications", "results", "timeline", "with_deadline", "without_deadline")
+
+
+def _encode_tool_result(result: dict) -> str:
+    """Serialise a tool result, trimming long row lists to fit the budget."""
+    encoded = json.dumps(result, default=str)
+    if len(encoded) <= MAX_TOOL_RESULT_CHARS:
+        return encoded
+
+    trimmed = dict(result)
+    for key in _TRIMMABLE:
+        rows = trimmed.get(key)
+        if not isinstance(rows, list) or not rows:
+            continue
+        # Binary search would be overkill; halve until it fits.
+        while len(rows) > 1 and len(json.dumps(trimmed, default=str)) > MAX_TOOL_RESULT_CHARS:
+            rows = rows[: len(rows) // 2]
+            trimmed[key] = rows
+        if len(rows) < len(result[key]):
+            trimmed[f"{key}_truncated"] = (
+                f"Showing {len(rows)} of {len(result[key])}. Counts elsewhere in this "
+                f"result cover all of them; narrow the query to see more rows."
+            )
+        if len(json.dumps(trimmed, default=str)) <= MAX_TOOL_RESULT_CHARS:
+            break
+
+    encoded = json.dumps(trimmed, default=str)
+    log.info("Trimmed tool result to %d chars to fit the context window", len(encoded))
+    return encoded[:MAX_TOOL_RESULT_CHARS]
+
 SYSTEM_INSTRUCTION = """\
 You are the assistant for one person's job search. You answer strictly from the \
 tools available to you, which read that person's own tracked email and \
@@ -180,18 +218,26 @@ def stream_answer(
             turns.append(
                 Turn(
                     role="tool",
-                    text=json.dumps(result, default=str),
+                    text=_encode_tool_result(result),
                     tool_call_id=call.id,
                     tool_name=call.name,
                 )
             )
 
         if round_index == MAX_TOOL_ROUNDS - 1:
-            yield {
-                "type": "error",
-                "message": "The assistant kept requesting tools without producing an answer.",
-            }
-            return
+            # Out of rounds. If text was already streamed it is a partial answer,
+            # not a failure — replacing it with an error would wipe the answer
+            # the user is currently reading.
+            if not answered:
+                yield {
+                    "type": "error",
+                    "message": (
+                        "The assistant kept requesting tools without producing an answer. "
+                        "Try asking something more specific."
+                    ),
+                }
+                return
+            break
 
     if not answered:
         yield {

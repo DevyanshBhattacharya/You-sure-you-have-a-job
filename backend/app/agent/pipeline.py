@@ -259,6 +259,10 @@ def process_email(session: Session, email: Email, *, reclassify: bool = False) -
     }
 
     if not verdict.is_job_related:
+        if reclassify:
+            # A correction has to undo the previous verdict's work, or a fixed
+            # classifier can never clean up after a broken one.
+            result["retracted_applications"] = resolve_mod.retract(session, email)
         return result
 
     outcome = resolve_mod.apply(session, email, verdict, reclassify=reclassify)

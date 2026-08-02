@@ -78,7 +78,34 @@ ollama pull nomic-embed-text      # embeddings        (~275 MB)
 LLM_PROVIDER=ollama
 OLLAMA_MODEL=qwen3:4b
 OLLAMA_EMBEDDING_MODEL=nomic-embed-text
+OLLAMA_NUM_CTX=16384
 ```
+
+> ⚠️ **`OLLAMA_NUM_CTX` is not a tuning knob — leave it large.** Ollama gives
+> every model a **4096-token** window by default, whatever the model actually
+> supports (qwen3 supports 262k). Past that it silently discards the *oldest*
+> tokens, which are the system instruction and the question. There is no error
+> and no warning: the model answers a prompt it can no longer read.
+>
+> A full email, or a tool result listing every application, clears 4096 easily.
+> Observed on this project at the default: asked "how many applications am I
+> tracking?", the model returned a 400-word report about "a simulated dataset"
+> and never gave a number. At 16384 the same question answers correctly.
+>
+> Confirm what a loaded model is really using — this is the ground truth, not
+> the model's advertised capacity:
+>
+> ```powershell
+> ollama ps      # the CONTEXT column
+> ```
+>
+> The adapter logs a warning when Ollama reports evaluating a prompt right up
+> to the ceiling, which is the visible symptom of an invisible truncation.
+
+> **Leave `OLLAMA_THINK=true` for reasoning models** (qwen3, deepseek-r1).
+> Setting it false does *not* stop them reasoning — it stops Ollama separating
+> the reasoning into its own field, so it arrives in `content` and gets shown
+> as the answer. Verified on Ollama 0.32.5 with qwen3:4b.
 
 **Option B — Gemini (hosted).** Better quality, but read the free-tier warning
 below before starting a backfill.
@@ -191,8 +218,25 @@ Open <http://localhost:5173>. The dev server proxies `/api` and `/ws` to the
 backend, so there's no CORS or WebSocket configuration to do.
 
 To import existing mail, click **Import mail** in the header (or
-`POST /api/sync/backfill` with `{"days": 90}`). After the backfill anchors the
-history cursor, the watcher takes over and new mail flows in automatically.
+`POST /api/sync/backfill` with `{"days": 90}`).
+
+**You only do this once.** After the import anchors the history cursor, the
+watcher polls every `POLL_INTERVAL_SECONDS` and new mail arrives on its own —
+there is nothing to click again. Specifically:
+
+- Mail already stored is skipped on any later import, matched on `gmail_id`, so
+  re-running costs nothing and never duplicates.
+- Transient network faults (dropped TLS, DNS, `429`, `5xx`) are retried with
+  backoff instead of aborting the run. A single `[SSL: WRONG_VERSION_NUMBER]`
+  used to kill an entire import.
+- An import that still ends early — crash, laptop closed, network gone — is
+  **resumed automatically on the next start** and picks up where it stopped.
+  Set `RESUME_BACKFILL_ON_START=false` to require a manual click instead.
+- Each message is handed to the agent as it arrives, so an interrupted import
+  keeps the classification work it already did.
+
+If the watcher is off for more than about a week Gmail expires the history
+cursor; it detects that and falls back to a windowed sweep.
 
 ### Trying it without Gmail
 
@@ -221,6 +265,19 @@ cd backend
 
 Manual corrections made in the **Inbox** tab are stored with
 `classification_source = "manual"`, which makes them a ready-made evaluation set.
+
+A replay that flips an email from job-related to not **retracts** what the old
+verdict recorded: its timeline entry and notifications go, and an application
+left with no events at all is deleted. Without that, a run of bad verdicts could
+never be cleaned up — the corrected emails would drop out while the applications
+they invented stayed on the board.
+
+So recovering from a bad classifier run is just a replay:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\replay.py --dry-run   # see what would change
+.\.venv\Scripts\python.exe scripts\replay.py             # apply
+```
 
 ---
 

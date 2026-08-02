@@ -35,6 +35,22 @@ class Settings(BaseSettings):
     ollama_embedding_model: str = "nomic-embed-text"
     # Local inference on CPU is slow; a per-request minute is not unusual.
     ollama_timeout_seconds: float = 300.0
+    # Context window, in tokens. This must be set explicitly: Ollama defaults to
+    # 4096 regardless of what the model supports, and silently drops the oldest
+    # tokens past that — which is the *start* of the prompt, i.e. the system
+    # instruction and the question. The failure is invisible (no error, no
+    # warning), and looks like the model ignoring its instructions. A full email
+    # or a tool result listing every application clears 4096 easily.
+    ollama_num_ctx: int = 16384
+    # Reasoning during *chat* (the Q&A agent). Keep it on for models that
+    # support it: setting this false does not stop a reasoning model reasoning,
+    # it stops Ollama separating the reasoning into its own `thinking` field, so
+    # it lands in `content` and is shown to the user as the answer. Verified on
+    # Ollama 0.32.5 with qwen3:4b. Only set it false for a non-reasoning model.
+    #
+    # It does not apply to schema-constrained extraction, where reasoning is
+    # always off — see the note in providers/ollama.py:generate_json.
+    ollama_think: bool = True
 
     # Gmail OAuth
     google_credentials_file: str = "credentials.json"
@@ -57,6 +73,10 @@ class Settings(BaseSettings):
     # can be turned off if a large backlog would be an unwelcome surprise.
     process_backlog_on_start: bool = True
     backlog_batch_limit: int = 1000
+
+    # Restart an import that a crash or a dropped connection left unfinished.
+    # Messages already stored are skipped, so this resumes rather than repeats.
+    resume_backfill_on_start: bool = True
 
     # Server
     cors_origins: str = "http://localhost:5173"

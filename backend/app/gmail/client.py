@@ -8,17 +8,79 @@ from __future__ import annotations
 import base64
 import binascii
 import logging
+import random
 import re
+import socket
+import ssl
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from email.utils import parseaddr
+from typing import TypeVar
 
+import httplib2
 from bs4 import BeautifulSoup
+from google.auth.exceptions import TransportError
 from googleapiclient.errors import HttpError
 
 from app.gmail.auth import get_service
 
 log = logging.getLogger(__name__)
+
+T = TypeVar("T")
+
+# Transport faults, not API rejections. These say nothing about the request and
+# everything about the network between here and Google — a proxy resetting a
+# connection, a flaky link, a DNS hiccup. `[SSL: WRONG_VERSION_NUMBER]` is the
+# usual shape when something intercepts TLS mid-handshake.
+_TRANSIENT_EXCEPTIONS = (
+    ssl.SSLError,
+    socket.gaierror,  # DNS
+    ConnectionError,
+    TimeoutError,  # socket.timeout is an alias of this
+    TransportError,
+    httplib2.HttpLib2Error,
+)
+
+# Rate limiting and Google-side faults. Anything else (401, 403, 404) is a real
+# answer and retrying it just wastes time.
+_TRANSIENT_STATUSES = {429, 500, 502, 503, 504}
+
+MAX_ATTEMPTS = 5
+
+
+def _is_transient(exc: Exception) -> bool:
+    if isinstance(exc, HttpError):
+        return getattr(exc.resp, "status", None) in _TRANSIENT_STATUSES
+    return isinstance(exc, _TRANSIENT_EXCEPTIONS)
+
+
+def with_retries(call: Callable[[], T], *, what: str) -> T:
+    """Retry a Gmail call through transient network failure.
+
+    Without this a single dropped connection aborts an entire import — which is
+    what turns "run the backfill once" into "run the backfill again and again".
+    """
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            return call()
+        except Exception as exc:  # noqa: BLE001 - re-raised below unless transient
+            if not _is_transient(exc) or attempt == MAX_ATTEMPTS:
+                raise
+            # Exponential backoff with jitter, so a whole backfill's worth of
+            # in-flight calls doesn't retry in lockstep.
+            delay = min(2 ** (attempt - 1), 16) + random.uniform(0, 0.5)
+            log.warning(
+                "%s failed (attempt %d/%d): %s — retrying in %.1fs",
+                what,
+                attempt,
+                MAX_ATTEMPTS,
+                str(exc)[:200],
+                delay,
+            )
+            time.sleep(delay)
+    raise AssertionError("unreachable")  # pragma: no cover
 
 # Headers worth keeping; the full set is noisy and mostly useless downstream.
 KEEP_HEADERS = {
@@ -88,7 +150,7 @@ def list_message_ids(
             maxResults=page_size,
             pageToken=page_token,
         )
-        resp = req.execute()
+        resp = with_retries(req.execute, what="messages.list")
         ids.extend(m["id"] for m in resp.get("messages", []))
         page_token = resp.get("nextPageToken")
         if not page_token:
@@ -100,8 +162,9 @@ def list_message_ids(
 def get_message(gmail_id: str) -> dict | None:
     """Fetch a full message. Returns None if it has since been deleted."""
     service = get_service()
+    req = service.users().messages().get(userId="me", id=gmail_id, format="full")
     try:
-        return service.users().messages().get(userId="me", id=gmail_id, format="full").execute()
+        return with_retries(req.execute, what=f"messages.get({gmail_id})")
     except HttpError as exc:
         if exc.resp.status == 404:
             log.info("Message %s no longer exists, skipping", gmail_id)
@@ -110,7 +173,8 @@ def get_message(gmail_id: str) -> dict | None:
 
 
 def get_profile() -> dict:
-    return get_service().users().getProfile(userId="me").execute()
+    req = get_service().users().getProfile(userId="me")
+    return with_retries(req.execute, what="getProfile")
 
 
 class HistoryTooOldError(RuntimeError):
@@ -128,18 +192,18 @@ def list_history(start_history_id: str) -> tuple[list[str], str | None]:
     page_token: str | None = None
 
     while True:
-        try:
-            resp = (
-                service.users()
-                .history()
-                .list(
-                    userId="me",
-                    startHistoryId=start_history_id,
-                    historyTypes=["messageAdded"],
-                    pageToken=page_token,
-                )
-                .execute()
+        req = (
+            service.users()
+            .history()
+            .list(
+                userId="me",
+                startHistoryId=start_history_id,
+                historyTypes=["messageAdded"],
+                pageToken=page_token,
             )
+        )
+        try:
+            resp = with_retries(req.execute, what="history.list")
         except HttpError as exc:
             if exc.resp.status == 404:
                 raise HistoryTooOldError(

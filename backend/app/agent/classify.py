@@ -10,7 +10,6 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.agent import llm, prefilter
-from app.config import get_settings
 from app.models import Email, EventType
 
 log = logging.getLogger(__name__)
@@ -135,22 +134,25 @@ def classify(session: Session, email: Email) -> Verdict:
         )
 
     if not llm.is_configured():
-        # Degraded mode: keep the app usable without a Gemini key.
+        # Degraded mode: keep the app usable before a backend is set up.
         signal = prefilter.has_job_signal(email)
         return Verdict(
             is_job_related=signal,
             confidence=0.4 if signal else 0.3,
             source="heuristic",
-            raw={"reason": "GEMINI_API_KEY not set; heuristic fallback"},
+            raw={"reason": f"no LLM backend configured ({llm.provider_name()}); heuristic"},
         )
 
-    settings = get_settings()
     try:
         result = llm.generate_json(
             prompt=build_prompt(email),
             schema=Extraction,
             system_instruction=SYSTEM_INSTRUCTION,
-            model=settings.classifier_model,
+            # No model argument: the configured provider resolves its own
+            # classifier model. Naming one here would hard-code a Gemini model
+            # id and hand it to whichever backend is selected — under Ollama
+            # every call then fails with "no model 'gemini-...'", and every
+            # email silently falls back to the heuristic below.
         )
     except llm.DeferWorkError:
         # Quota exhausted, or the backend is unreachable (Ollama not running).

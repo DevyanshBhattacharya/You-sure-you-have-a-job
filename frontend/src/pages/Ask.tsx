@@ -17,6 +17,26 @@ const SUGGESTIONS = [
   "What did the recruiter ask me to send?",
 ];
 
+/**
+ * Seconds since `active` became true.
+ *
+ * A local model can take minutes to answer, during which the stream is silent.
+ * Without a moving number the page is indistinguishable from a hung request.
+ */
+function useElapsed(active: boolean): number {
+  const [seconds, setSeconds] = useState(0);
+
+  useEffect(() => {
+    if (!active) return;
+    setSeconds(0);
+    const started = Date.now();
+    const id = setInterval(() => setSeconds(Math.floor((Date.now() - started) / 1000)), 1000);
+    return () => clearInterval(id);
+  }, [active]);
+
+  return seconds;
+}
+
 function Citations({ citations }: { citations: Citation[] }) {
   if (citations.length === 0) return null;
   return (
@@ -50,6 +70,7 @@ export default function Ask() {
 
   const abortRef = useRef<AbortController | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const elapsed = useElapsed(streaming);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -162,7 +183,9 @@ export default function Ask() {
                 <div className="text-sm leading-relaxed whitespace-pre-wrap text-slate-800 dark:text-slate-200">
                   {turn.content}
                   {streaming && i === turns.length - 1 && !turn.content && (
-                    <span className="text-slate-400 italic">Thinking…</span>
+                    <span className="text-slate-400 italic">
+                      Thinking… {elapsed > 2 && `${elapsed}s`}
+                    </span>
                   )}
                 </div>
                 {turn.citations && <Citations citations={turn.citations} />}
@@ -175,6 +198,7 @@ export default function Ask() {
           <p className="text-xs text-slate-400 dark:text-slate-500">
             <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-sky-500 align-middle" />
             <span className="ml-2 font-mono">{activeTool}</span> …
+            {elapsed > 2 && <span className="ml-1">{elapsed}s</span>}
           </p>
         )}
 

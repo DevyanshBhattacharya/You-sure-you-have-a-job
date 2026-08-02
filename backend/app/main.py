@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app import events
+from app import backfill, events
 from app.agent import pipeline
 from app.api import (
     routes_applications,
@@ -24,10 +25,29 @@ from app.db import init_db
 from app.gmail import auth as gmail_auth
 from app.gmail import watcher
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
-)
+
+def _configure_logging() -> None:
+    """Set up logging, and make the console safe for real email content.
+
+    A Windows console encodes as cp1252 by default, so logging a subject line
+    containing an emoji — routine in recruiter mail — raises UnicodeEncodeError
+    inside the handler and prints a logging traceback instead of the record.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (ValueError, OSError):  # pragma: no cover - detached stream
+                pass
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+    )
+
+
+_configure_logging()
 log = logging.getLogger("app")
 
 
@@ -55,6 +75,9 @@ async def lifespan(_app: FastAPI):
     if access.usable:
         log.info("Gmail ready as %s", access.address)
         watcher.start()
+        if settings.resume_backfill_on_start:
+            # A dropped connection used to mean clicking "Import mail" again.
+            backfill.resume_if_interrupted(on_email=pipeline.submit_email_id)
     else:
         log.warning("Gmail watcher not started: %s", access.error)
         if access.hint:

@@ -179,3 +179,101 @@ class TestClassifierFailureHandling:
         assert email.processed_at is not None
         assert email.classification_source == "heuristic"
         assert result["email"]["is_job_related"] is True
+
+
+class TestRetractionOnReclassify:
+    """A corrected verdict must undo what the wrong one recorded.
+
+    Regression: classification silently degraded to a heuristic for every email,
+    which built applications from sender names ("Jia from Unstop" out of a
+    newsletter). Re-running with a working classifier flipped the emails to
+    not-job-related but left those applications behind, so the data could never
+    be repaired.
+    """
+
+    def _classify_as(self, monkeypatch, job_related: bool, company: str = "Northwind"):
+        from app.agent import classify as classify_mod
+
+        extraction = classify_mod.Extraction(
+            is_job_related=job_related,
+            confidence=0.95,
+            event_type="applied",
+            company=company,
+            summary="test",
+        )
+        monkeypatch.setattr(
+            classify_mod,
+            "classify",
+            lambda _s, _e: classify_mod.Verdict(
+                is_job_related=job_related,
+                confidence=0.95,
+                source="llm",
+                raw=extraction.model_dump(),
+                extraction=extraction,
+            ),
+        )
+
+    def test_flipping_to_not_job_related_removes_the_application(self, db, monkeypatch):
+        from app.agent import pipeline
+        from app.models import Application, ApplicationEvent
+
+        email = make_email(db, subject="Trending internships", body="Jobs you may like")
+
+        self._classify_as(monkeypatch, True)
+        pipeline.process_email(db, email)
+        db.commit()
+        assert db.query(Application).count() == 1
+        assert db.query(ApplicationEvent).count() == 1
+
+        # The classifier is fixed and now sees it for the newsletter it is.
+        self._classify_as(monkeypatch, False)
+        result = pipeline.process_email(db, email, reclassify=True)
+        db.commit()
+
+        assert result["email"]["is_job_related"] is False
+        assert len(result["retracted_applications"]) == 1
+        assert db.query(Application).count() == 0
+        assert db.query(ApplicationEvent).count() == 0
+
+    def test_an_application_with_other_evidence_survives(self, db, monkeypatch):
+        """Only applications left with no timeline at all are removed."""
+        from app.agent import pipeline
+        from app.models import Application, ApplicationEvent
+
+        first = make_email(db, subject="Application received", body="Thanks for applying")
+        second = make_email(
+            db, gmail_id="g-second", subject="Interview invite", body="Pick a slot"
+        )
+
+        self._classify_as(monkeypatch, True, company="Northwind")
+        pipeline.process_email(db, first)
+        pipeline.process_email(db, second)
+        db.commit()
+        assert db.query(Application).count() == 1
+        assert db.query(ApplicationEvent).count() == 2
+
+        # Retract only the second email.
+        self._classify_as(monkeypatch, False)
+        pipeline.process_email(db, second, reclassify=True)
+        db.commit()
+
+        assert db.query(Application).count() == 1
+        assert db.query(ApplicationEvent).count() == 1
+
+    def test_a_normal_pass_never_retracts(self, db, monkeypatch):
+        """Without reclassify, a not-job-related verdict is just a no-op."""
+        from app.agent import pipeline
+        from app.models import Application
+
+        email = make_email(db, subject="Application received", body="Thanks for applying")
+        self._classify_as(monkeypatch, True)
+        pipeline.process_email(db, email)
+        db.commit()
+
+        other = make_email(db, gmail_id="g-other", subject="Newsletter", body="Deals")
+        self._classify_as(monkeypatch, False)
+        result = pipeline.process_email(db, other)
+        db.commit()
+
+        assert "retracted_applications" not in result
+        assert db.query(Application).count() == 1
