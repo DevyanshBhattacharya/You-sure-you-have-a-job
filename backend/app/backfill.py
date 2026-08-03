@@ -48,6 +48,7 @@ def status() -> dict:
             "done": statestore.get_int(session, BACKFILL_DONE),
             "error": statestore.get(session, BACKFILL_ERROR),
             "last_history_id": statestore.get(session, statestore.LAST_HISTORY_ID),
+            "last_sync_at": statestore.get(session, statestore.LAST_SYNC_AT),
         }
 
 
@@ -91,6 +92,25 @@ def resume_if_interrupted(*, on_email=None) -> bool:
         (error or "no error recorded")[:120],
         days,
     )
+    return start(days, on_email=on_email)
+
+
+def start_if_never_run(*, on_email=None) -> bool:
+    """Run the first import automatically. Returns False if one already happened.
+
+    Without this the app sits empty until someone notices the "Import mail"
+    button, and every restart looks like it did nothing. Keyed on
+    `backfill_complete` rather than on the row count, so a mailbox that
+    genuinely has no job mail isn't re-imported on every boot.
+    """
+    from app.config import get_settings
+
+    with session_scope() as session:
+        if statestore.get(session, statestore.BACKFILL_COMPLETE) == "true":
+            return False
+        days = statestore.get_int(session, BACKFILL_DAYS) or get_settings().backfill_default_days
+
+    log.info("No import has completed yet; starting one automatically (%d days)", days)
     return start(days, on_email=on_email)
 
 

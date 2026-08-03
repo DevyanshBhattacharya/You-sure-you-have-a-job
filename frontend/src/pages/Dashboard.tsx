@@ -166,7 +166,7 @@ export default function Dashboard({ onOpen }: { onOpen: (id: number) => void }) 
       {isEmpty ? (
         <EmptyState
           title="No applications tracked yet"
-          hint="Run a backfill from the header to import your recent mail, or wait for the watcher to pick up the next message."
+          hint="Mail imports and classifies on its own — the header shows which stage is running. Only mail about applications you actually made lands here; alerts and job-board digests stay in the inbox under 'Filtered out'."
         />
       ) : (
         <div className="grid gap-6 xl:grid-cols-[1fr_20rem]">

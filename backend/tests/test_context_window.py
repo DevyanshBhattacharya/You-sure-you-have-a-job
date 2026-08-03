@@ -54,8 +54,27 @@ class TestExplicitContextWindow:
         route(handler)
         provider.generate_json(prompt="hi", schema=Probe)
 
-        assert seen["options"]["num_ctx"] == get_settings().ollama_num_ctx
+        assert seen["options"]["num_ctx"] == get_settings().ollama_extraction_num_ctx
         assert seen["options"]["num_ctx"] > 4096
+
+    def test_extraction_does_not_pay_for_the_chat_window(self, provider, route):
+        """A window is not free: its KV cache sits in VRAM beside the weights,
+        so sizing extraction for the Q&A agent's tool results evicts layers to
+        the CPU. Measured on qwen3:4b, that took one classification of a
+        500-token prompt from seconds to over ten minutes."""
+        seen: dict = {}
+
+        def handler(request):
+            seen.update(json.loads(request.content))
+            return httpx.Response(200, json={"message": {"content": '{"ok": true}'}})
+
+        route(handler)
+        provider.generate_json(prompt="hi", schema=Probe)
+
+        settings = get_settings()
+        assert seen["options"]["num_ctx"] < settings.ollama_num_ctx
+        # Still has to clear the capped extraction prompt with room to spare.
+        assert seen["options"]["num_ctx"] >= 4096
 
     def test_stream_turn_sends_num_ctx(self, provider, route):
         seen: dict = {}

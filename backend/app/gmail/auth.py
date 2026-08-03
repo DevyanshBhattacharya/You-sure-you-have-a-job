@@ -6,6 +6,7 @@ Read-only scope. The agent never needs to modify the mailbox.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import threading
 from dataclasses import dataclass
@@ -22,7 +23,11 @@ log = logging.getLogger(__name__)
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 
 _lock = threading.Lock()
-_service = None
+
+# One service per thread, never one shared between them. See get_service().
+_local = threading.local()
+# Bumped by reset_service(); a thread rebuilds when its cached copy is stale.
+_generation = 0
 
 
 class GmailAuthError(RuntimeError):
@@ -75,9 +80,21 @@ def load_credentials(*, allow_interactive: bool = True) -> Credentials:
 
 
 def _persist(creds: Credentials) -> None:
+    """Write the token file atomically.
+
+    Each thread holds its own credentials, so two can refresh at once. Writing
+    in place would let one truncate the file while the other reads it, leaving
+    a corrupt token and an unexplained re-consent. Write, then rename.
+    """
     token_path = get_settings().token_path
     token_path.parent.mkdir(parents=True, exist_ok=True)
-    token_path.write_text(creds.to_json(), encoding="utf-8")
+
+    tmp = token_path.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        tmp.write_text(creds.to_json(), encoding="utf-8")
+        os.replace(tmp, token_path)
+    finally:
+        tmp.unlink(missing_ok=True)
     log.info("Saved Gmail token to %s", token_path)
 
 
@@ -167,24 +184,44 @@ def access_status() -> AccessStatus:
 
 
 def get_service(*, allow_interactive: bool = True):
-    """Return a cached Gmail API service client.
+    """Return this thread's Gmail API service client.
 
-    The googleapiclient service object is not thread-safe for concurrent use of
-    the same http object, but each request builds its own; guarding creation is
-    enough for our access pattern (one watcher thread + threadpool endpoints).
+    Deliberately per-thread, not a shared singleton. `build()` creates a single
+    `httplib2.Http` and every request from that service reuses it — and httplib2
+    is not thread-safe. Two threads calling Gmail at once (the watcher polling
+    while a backfill imports) interleave writes on the same TLS socket, then
+    each reads back bytes meant for the other. OpenSSL sees a record header that
+    isn't one and reports:
+
+        [SSL: WRONG_VERSION_NUMBER] wrong version number
+
+    which looks like a proxy or TLS problem and is neither. Retrying does not
+    help, because both threads simply collide again.
+
+    A thread keeps its own connection pool across calls, so an import still
+    reuses one connection for thousands of messages.
     """
-    global _service
+    cached = getattr(_local, "service", None)
+    if cached is not None and getattr(_local, "generation", None) == _generation:
+        return cached
+
+    # Only credential loading is shared; the service itself must not be.
     with _lock:
-        if _service is None:
-            creds = load_credentials(allow_interactive=allow_interactive)
-            _service = build("gmail", "v1", credentials=creds, cache_discovery=False)
-        return _service
+        creds = load_credentials(allow_interactive=allow_interactive)
+        generation = _generation
+
+    service = build("gmail", "v1", credentials=creds, cache_discovery=False)
+    _local.service = service
+    _local.generation = generation
+    return service
 
 
 def reset_service() -> None:
-    global _service
+    """Invalidate every thread's cached service."""
+    global _generation
     with _lock:
-        _service = None
+        _generation += 1
+    _local.service = None
 
 
 if __name__ == "__main__":

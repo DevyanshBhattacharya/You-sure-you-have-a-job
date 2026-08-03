@@ -67,6 +67,40 @@ def index_email(session: Session, email: Email, *, application_id: int | None = 
     return len(chunks)
 
 
+def remove_email(session: Session, email: Email) -> int:
+    """Drop an email's chunks. Returns how many were removed.
+
+    Indexing only ever ran on the way in, so an email that later turned out not
+    to be job related kept its chunks forever and stayed searchable. The Q&A
+    agent would then quote a LinkedIn digest as evidence about the job search,
+    with no way for anyone to tell where it came from.
+    """
+    removed = session.execute(delete(KBChunk).where(KBChunk.email_id == email.id)).rowcount or 0
+    if removed:
+        session.flush()
+        store.invalidate()
+        log.info("Removed %d knowledge-base chunk(s) for email %s", removed, email.id)
+    return removed
+
+
+def stale_dimension_count(session: Session) -> int:
+    """Chunks embedded by a different model than the one now configured.
+
+    Vectors of different widths are not comparable, so the store only searches
+    ones matching the current model — anything else is silently invisible rather
+    than wrong. Counting them is how that becomes visible instead.
+    """
+    from sqlalchemy import func
+
+    dims = session.execute(
+        select(KBChunk.dim, func.count()).where(KBChunk.dim.is_not(None)).group_by(KBChunk.dim)
+    ).all()
+    if len(dims) < 2:
+        return 0
+    live = max(dims, key=lambda row: row[1])[0]
+    return sum(count for dim, count in dims if dim != live)
+
+
 def embed_query(text: str) -> list[float] | None:
     """Embed a search query. Returns None when embeddings are unavailable."""
     if not llm.is_configured():

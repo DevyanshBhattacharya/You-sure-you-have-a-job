@@ -36,10 +36,19 @@ publisher that emits the same `EmailWork` item — nothing downstream changes.
 
 A few decisions worth knowing about:
 
-- **The prefilter is a cost lever, not a correctness one.** It only rejects mail
-  it is confident about, and is biased toward false positives: letting a
-  newsletter through costs one cheap model call, dropping a real interview
-  invite costs an interview.
+- **The prefilter turns on a strong/weak signal split.** A *strong* signal —
+  "your application", an interview, an assessment, or mail from an employer's
+  own recruiting address — overrides every bulk-mail rule, because a genuine ATS
+  acknowledgement carries `List-Unsubscribe` and usually lands in Promotions. A
+  *weak* one (the word "job" somewhere, or "linkedin" in the sender) overrides
+  nothing. Getting that backwards is what filled the board with digests: on a
+  real mailbox, 96% of mail was rejected without a model call once being a job
+  board stopped counting as a signal, and no genuine application was lost.
+- **The board tracks applications you made, not jobs that exist.** Being job
+  *related* and being *yours* are separate questions, so the classifier answers
+  both (`is_job_related`, `recipient_applied`) and only the second opens an
+  application. Job alerts, adverts and cold outreach stay searchable in the
+  inbox and the knowledge base; they just never reach the board.
 - **`Application.status` is derived and guarded by a state machine.** A late
   "thanks for applying" auto-reply cannot drag an application that already
   reached `offer` back to `applied`. The timeline (`application_events`) is
@@ -79,6 +88,7 @@ LLM_PROVIDER=ollama
 OLLAMA_MODEL=qwen3:4b
 OLLAMA_EMBEDDING_MODEL=nomic-embed-text
 OLLAMA_NUM_CTX=16384
+OLLAMA_EXTRACTION_NUM_CTX=6144
 ```
 
 > ⚠️ **`OLLAMA_NUM_CTX` is not a tuning knob — leave it large.** Ollama gives
@@ -92,11 +102,42 @@ OLLAMA_NUM_CTX=16384
 > tracking?", the model returned a 400-word report about "a simulated dataset"
 > and never gave a number. At 16384 the same question answers correctly.
 >
+> **But a window is not free, which is why there are two of them.** Its KV cache
+> is allocated in VRAM beside the weights, so an oversized one pushes layers onto
+> the CPU. Measured here on qwen3:4b against a 4 GB card (GTX 1650), footprint
+> from `ollama ps`:
+>
+> | Window | Model footprint | Fits in 4 GB? |
+> |---|---|---|
+> | 16384 | 5.09 GB | no — only 2.65 GB stayed resident, half the layers on CPU |
+> | 6144 | 3.52 GB | yes |
+>
+> So `OLLAMA_NUM_CTX` sizes *chat*, where tool results really are large, and
+> `OLLAMA_EXTRACTION_NUM_CTX` sizes classification, whose prompt is capped by
+> `classify.MAX_PROMPT_BODY_CHARS`. Truncation is still reported for both, so
+> raise the extraction window if you ever see that warning.
+>
+> Note that Ollama reloads the model whenever the requested window changes, so
+> asking a question mid-import costs one reload each way. Classification runs in
+> bulk, so this is one reload per switch, not per email.
+>
+> **If classification is slow, check memory before tuning anything.** On a 4 GB
+> card a 4B model is already marginal; if system RAM is also short the runner
+> pages and a *ten-token* prompt can fail to return in 90 seconds. `nvidia-smi`
+> and free RAM tell you this in one look. The cheapest fix is a smaller
+> classifier — extraction is a much easier job than chat, and the two models are
+> already separate settings:
+>
+> ```ini
+> OLLAMA_MODEL=qwen3:1.7b        # classification: high volume, simple task
+> OLLAMA_QA_MODEL=qwen3:4b       # chat: low volume, needs the reasoning
+> ```
+>
 > Confirm what a loaded model is really using — this is the ground truth, not
 > the model's advertised capacity:
 >
 > ```powershell
-> ollama ps      # the CONTEXT column
+> ollama ps      # the CONTEXT column, and how much sits in VRAM
 > ```
 >
 > The adapter logs a warning when Ollama reports evaluating a prompt right up
@@ -217,12 +258,11 @@ npm run dev
 Open <http://localhost:5173>. The dev server proxies `/api` and `/ws` to the
 backend, so there's no CORS or WebSocket configuration to do.
 
-To import existing mail, click **Import mail** in the header (or
-`POST /api/sync/backfill` with `{"days": 90}`).
-
-**You only do this once.** After the import anchors the history cursor, the
-watcher polls every `POLL_INTERVAL_SECONDS` and new mail arrives on its own —
-there is nothing to click again. Specifically:
+**You never have to import by hand.** On first start the backend imports on its
+own (`AUTO_BACKFILL_ON_START`), then the watcher polls every
+`POLL_INTERVAL_SECONDS` and new mail arrives without being asked. The header
+button stays as a manual override and for changing the window
+(`POST /api/sync/backfill` with `{"days": 90}`). Specifically:
 
 - Mail already stored is skipped on any later import, matched on `gmail_id`, so
   re-running costs nothing and never duplicates.
@@ -234,9 +274,33 @@ there is nothing to click again. Specifically:
   Set `RESUME_BACKFILL_ON_START=false` to require a manual click instead.
 - Each message is handed to the agent as it arrives, so an interrupted import
   keeps the classification work it already did.
+- Imported-but-unclassified mail is re-swept every `BACKLOG_SWEEP_SECONDS`, so
+  a remainder past `BACKLOG_BATCH_LIMIT` — or work lost from the in-memory queue
+  when the process stopped — drains without a restart.
 
 If the watcher is off for more than about a week Gmail expires the history
-cursor; it detects that and falls back to a windowed sweep.
+cursor; it detects that and falls back to a windowed sweep **sized to the actual
+gap** since `last_sync_at`, not a fixed window. A machine off for a month would
+otherwise come back, sweep three days, reset the cursor, and lose the rest
+permanently.
+
+> **Importing and classifying are different stages, at very different speeds.**
+> A local model spends tens of seconds per email, so an import can report
+> complete while the board is still empty — which looks exactly like nothing
+> happened, and invites pressing Import again (which correctly does nothing,
+> since every message is already fetched). The header therefore reports
+> whichever stage is actually busy: `Importing 12/13`, then `Classifying · 96
+> left`, then `Watching for new mail`.
+
+> **`[SSL: WRONG_VERSION_NUMBER]` from the Gmail client is a threading bug, not
+> a TLS one.** `googleapiclient.discovery.build()` creates a single
+> `httplib2.Http`, every request from that service reuses it, and httplib2 is
+> not thread-safe. With the watcher polling while an import runs, two threads
+> write to one TLS socket and each reads back the other's bytes; OpenSSL reports
+> the garbled record header as a wrong protocol version. It looks like a proxy
+> or a firewall and is neither, and retrying only makes the threads collide
+> again. `app/gmail/auth.py` therefore hands out **one service per thread**.
+> Measured over 12 concurrent calls: shared 6 failures, per-thread 0.
 
 ### Trying it without Gmail
 
@@ -264,7 +328,16 @@ cd backend
 ```
 
 Manual corrections made in the **Inbox** tab are stored with
-`classification_source = "manual"`, which makes them a ready-made evaluation set.
+`classification_source = "manual"`, which makes them a ready-made evaluation
+set — and they **act**, rather than just relabelling:
+
+- "Not job related" retracts the application the old verdict created (unless
+  other emails still support it).
+- "Job related" re-runs extraction with the prefilter skipped, so the message
+  reaches the board even if a rule rejected it.
+
+The manual verdict is sticky. A correction that lasted only until the next
+replay would just be re-rejected by the rule the person was overriding.
 
 A replay that flips an email from job-related to not **retracts** what the old
 verdict recorded: its timeline entry and notifications go, and an application
@@ -361,6 +434,59 @@ frontend/
     pages/      Dashboard, Applications, Inbox, Ask
     components/ shared UI
 ```
+
+---
+
+## Deploying this anywhere but your laptop
+
+Read this before exposing the port. The app serves the full text of one
+mailbox and will summarise it on request, so the default posture — no
+authentication — is safe on loopback and nowhere else.
+
+**1. Set a token.** `APP_AUTH_TOKEN` guards every `/api` and `/ws` route.
+
+```powershell
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+Unset, the server runs open and logs a warning at startup saying so. Set, it
+also disables `/docs`, `/redoc` and `/openapi.json`. The dashboard asks for the
+token on its first 401 and keeps it in `localStorage` — deliberately not a
+cookie, because a cookie is attached to cross-site requests automatically and
+this app has no CSRF defence.
+
+**2. Terminate TLS in front of it.** A bearer token over plain HTTP is readable
+by anything on the path, and the WebSocket passes it in the query string
+(browsers cannot set headers on a handshake), where proxies log it.
+
+**3. Name your origins.** `CORS_ORIGINS` must list exact origins, never `*`.
+It also vets the `Origin` on WebSocket handshakes — CORS does not apply to
+WebSockets, so without that check any page you visit could open a socket to a
+localhost server and read your notification feed.
+
+**4. Bind deliberately.** `--host 127.0.0.1` unless something in front of it is
+doing the TLS and the token is set.
+
+### What this is not
+
+**Single-user by construction.** There is one Gmail token on disk, one
+database, one shared secret. Nothing in the data model is scoped to a user —
+`GET /api/applications` means *the* applications, not *yours*. Serving a second
+person means per-user OAuth, a tenant column on every table, and authorisation
+on every query. That is a rewrite of the data layer, not a login screen; do not
+mistake the token for a step toward it.
+
+**Untrusted input reaches the model, by design.** Anyone can email you, and that
+mail is fed to the classifier and quoted back by the Q&A agent. Both system
+prompts state that message text is data and never instruction. Constrained
+decoding bounds the damage — the classifier can only emit the extraction schema,
+and every tool is read-only — so the worst case is a wrong verdict on one email,
+which the Inbox override corrects. It is a real limitation, not a solved
+problem.
+
+**No rate limiting.** `POST /api/chat` triggers model work on every call. Behind
+the token that is your own usage; if you ever drop the token, put a limiter in
+front.
 
 ---
 

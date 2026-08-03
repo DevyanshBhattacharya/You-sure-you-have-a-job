@@ -15,6 +15,10 @@ from tests.fixtures import make_email
 
 
 def verdict(**kwargs) -> Verdict:
+    # `recipient_applied` defaults true here because these tests are about what
+    # resolve does *once* an email is established as the user's own application.
+    # The gate that decides that is exercised in TestOnlyOwnApplications below.
+    kwargs.setdefault("recipient_applied", True)
     extraction = Extraction(is_job_related=True, confidence=0.95, **kwargs)
     return Verdict(
         is_job_related=True,
@@ -228,3 +232,86 @@ class TestNotifications:
         title = out.notifications[0].row.title
         assert "Acme" in title
         assert "Backend Engineer" in title
+
+
+class TestOnlyOwnApplications:
+    """The board holds applications the user made — not adverts for jobs.
+
+    Before this gate, any job-related email opened an application, named after
+    the sender's display name when no company was extracted. A real mailbox
+    produced a board of "LinkedIn", "Coursera", "Smriti Jain" and "Handshake AI
+    Team": 37 of 40 entries were digests and connection invites.
+    """
+
+    def _verdict(self, *, source="llm", applied=True, **kwargs) -> Verdict:
+        extraction = Extraction(
+            is_job_related=True, confidence=0.95, recipient_applied=applied, **kwargs
+        )
+        return Verdict(
+            is_job_related=True,
+            confidence=0.95,
+            source=source,
+            raw=extraction.model_dump(),
+            extraction=extraction,
+        )
+
+    def test_an_application_the_user_made_is_tracked(self, db):
+        email = make_email(db, subject="Thank you for applying to Acme")
+        outcome = apply(db, email, self._verdict(company="Acme", event_type="acknowledgement"))
+        assert outcome is not None
+        assert outcome.application.company == "Acme"
+
+    def test_a_job_advert_is_not_tracked(self, db):
+        """"Acme is hiring" names a company, but the user never applied."""
+        email = make_email(db, subject="Acme is hiring for a Remote role")
+        outcome = apply(
+            db, email, self._verdict(company="Acme", applied=False, event_type="other")
+        )
+        assert outcome is None
+        assert db.query(Application).count() == 0
+
+    def test_cold_recruiter_outreach_is_not_tracked(self, db):
+        email = make_email(db, subject="Exciting opportunity at Acme")
+        outcome = apply(
+            db,
+            email,
+            self._verdict(company="Acme", applied=False, event_type="recruiter_outreach"),
+        )
+        assert outcome is None
+
+    def test_a_heuristic_guess_never_opens_an_application(self, db):
+        """No extraction means no idea who applied to what. This is the exact
+        path that filled the board with sender display names."""
+        email = make_email(db, subject="Devyansh, your posts got 120 impressions")
+        heuristic = Verdict(is_job_related=True, confidence=0.3, source="heuristic")
+        assert apply(db, email, heuristic) is None
+        assert db.query(Application).count() == 0
+
+    def test_an_unnamed_company_never_opens_an_application(self, db):
+        email = make_email(db, subject="Update on your application")
+        outcome = apply(db, email, self._verdict(company="", event_type="acknowledgement"))
+        assert outcome is None
+
+    def test_an_interview_is_tracked_even_if_the_model_forgets_the_flag(self, db):
+        """Nobody schedules an interview with someone who never applied, so the
+        event type is trusted over a wrongly-false `recipient_applied`."""
+        email = make_email(db, subject="Interview scheduled with Acme")
+        outcome = apply(
+            db,
+            email,
+            self._verdict(company="Acme", applied=False, event_type="interview_scheduled"),
+        )
+        assert outcome is not None
+        assert outcome.application.status == ApplicationStatus.INTERVIEWING
+
+    def test_a_reply_on_a_tracked_thread_still_counts(self, db):
+        """Follow-ups often look like nothing in isolation; thread lineage is
+        unambiguous, so it overrides the gate."""
+        first = make_email(db, gmail_id="a", thread_id="t9", subject="Thanks for applying")
+        apply(db, first, self._verdict(company="Acme", event_type="acknowledgement"))
+
+        reply = make_email(db, gmail_id="b", thread_id="t9", subject="Re: Thanks for applying")
+        outcome = apply(db, reply, self._verdict(company="", applied=False, event_type="other"))
+        assert outcome is not None
+        assert outcome.created_application is False
+        assert db.query(Application).count() == 1

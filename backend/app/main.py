@@ -7,10 +7,11 @@ import logging
 import sys
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
-from app import backfill, events
+from app import backfill, events, security
 from app.agent import pipeline
 from app.api import (
     routes_applications,
@@ -54,6 +55,7 @@ log = logging.getLogger("app")
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_db()
+    security.warn_if_unprotected()
     events.bind_loop(asyncio.get_running_loop())
     pipeline.start_workers()
 
@@ -74,10 +76,16 @@ async def lifespan(_app: FastAPI):
     access = gmail_auth.access_status()
     if access.usable:
         log.info("Gmail ready as %s", access.address)
-        watcher.start()
+        # Import before starting the watcher, not after. The watcher polls
+        # immediately and skips its cycle while an import owns the history
+        # cursor — but only if the import is already marked running by then.
+        started = False
         if settings.resume_backfill_on_start:
             # A dropped connection used to mean clicking "Import mail" again.
-            backfill.resume_if_interrupted(on_email=pipeline.submit_email_id)
+            started = backfill.resume_if_interrupted(on_email=pipeline.submit_email_id)
+        if not started and settings.auto_backfill_on_start:
+            backfill.start_if_never_run(on_email=pipeline.submit_email_id)
+        watcher.start()
     else:
         log.warning("Gmail watcher not started: %s", access.error)
         if access.hint:
@@ -92,13 +100,52 @@ async def lifespan(_app: FastAPI):
 
 settings = get_settings()
 
+# Swagger fetches /openapi.json from the browser without an Authorization
+# header, so the docs cannot be put behind the token — they either stay open or
+# they go. Tie them to the deployment posture instead: a configured token means
+# this is reachable from somewhere, and an unauthenticated map of every endpoint
+# is not something to publish alongside it.
+_docs_enabled = not settings.app_auth_token
+
 app = FastAPI(
     title="Job Mail Agent",
     version="0.1.0",
     description="Tracks job-related email, keeps a knowledge base, and answers questions about it.",
     lifespan=lifespan,
+    docs_url="/docs" if _docs_enabled else None,
+    redoc_url="/redoc" if _docs_enabled else None,
+    openapi_url="/openapi.json" if _docs_enabled else None,
 )
 
+@app.middleware("http")
+async def require_token(request: Request, call_next):
+    """Guard every /api route with the shared secret, when one is configured.
+
+    A middleware rather than a per-route dependency, so a router added later
+    cannot quietly ship unauthenticated — the failure mode of the dependency
+    approach is an endpoint nobody remembered to annotate.
+    """
+    # Preflight carries no credentials by design; blocking it breaks CORS
+    # without protecting anything, since the real request is still checked.
+    if request.method == "OPTIONS" or not security.requires_token(request.url.path):
+        return await call_next(request)
+
+    if not security.token_is_valid(security.token_from_request(request)):
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Missing or invalid API token."},
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    return await call_next(request)
+
+
+# Registered AFTER the auth middleware on purpose. Starlette makes the
+# last-added middleware the outermost, so this ordering puts CORS on the
+# outside — which is the only way a 401 comes back carrying
+# `Access-Control-Allow-Origin`. With the order reversed, a cross-origin
+# dashboard sees an opaque network error instead of a 401 and never learns to
+# ask for a token.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origin_list,

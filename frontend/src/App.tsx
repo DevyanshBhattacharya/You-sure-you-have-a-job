@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
-import { api } from "./api/client";
+import { useEffect, useRef, useState } from "react";
+import { ApiError, api, setToken } from "./api/client";
 import { PriorityDot } from "./components/ui";
 import { useNotifications } from "./hooks/useNotifications";
 import Applications from "./pages/Applications";
@@ -35,19 +35,63 @@ function ConnectionPill({ state }: { state: "connecting" | "open" | "closed" }) 
   );
 }
 
-function SyncButton() {
+/**
+ * Import and classification state.
+ *
+ * Deliberately not just a button. Importing and classifying are separate
+ * stages: a local model spends tens of seconds on each email, so the import can
+ * report "complete" while the board stays empty for a long time afterwards.
+ * Showing only import progress made that look like nothing had happened, and
+ * the only affordance on screen was to press Import again — which correctly did
+ * nothing, because every message had already been fetched.
+ *
+ * So the widget reports whichever stage is actually busy, surfaces a failed or
+ * interrupted import with the reason, and keeps the manual trigger as a
+ * fallback rather than the main path. The server imports on its own.
+ */
+function SyncIndicator() {
   const queryClient = useQueryClient();
   const { data: sync } = useQuery({
     queryKey: ["sync"],
     queryFn: api.syncStatus,
-    // Only poll while an import is actually in flight.
-    refetchInterval: (query) => (query.state.data?.running ? 2000 : false),
+    // Poll fast while something is moving, slowly otherwise — the server can
+    // start an import by itself, so "idle" still has to be observed.
+    refetchInterval: (query) => {
+      const s = query.state.data;
+      if (!s) return 5_000;
+      return s.running || s.pending_classification > 0 ? 2_000 : 20_000;
+    },
   });
 
   const start = useMutation({
     mutationFn: () => api.startBackfill(),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["sync"] }),
   });
+
+  // Refresh the board when the last email finishes classifying. The WebSocket
+  // normally does this; this covers the case where it dropped mid-run.
+  const wasPending = useRef(0);
+  useEffect(() => {
+    const pending = sync?.pending_classification ?? 0;
+    if (wasPending.current > 0 && pending === 0) {
+      for (const key of ["board", "stats", "applications", "emails", "notifications"]) {
+        queryClient.invalidateQueries({ queryKey: [key] });
+      }
+    }
+    wasPending.current = pending;
+  }, [sync?.pending_classification, queryClient]);
+
+  const failed = sync?.status === "error" || sync?.status === "interrupted";
+  const retry = (
+    <button
+      type="button"
+      onClick={() => start.mutate()}
+      disabled={start.isPending || sync?.running}
+      className="rounded-lg border border-slate-300 px-3 py-1.5 text-xs font-medium text-slate-700 transition hover:bg-slate-100 disabled:opacity-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+    >
+      {start.isPending ? "Starting…" : failed ? "Retry import" : "Import mail"}
+    </button>
+  );
 
   if (sync?.running) {
     const pct = sync.total > 0 ? Math.round((sync.done / sync.total) * 100) : 0;
@@ -58,9 +102,39 @@ function SyncButton() {
     );
   }
 
+  if (sync?.quota_blocked) {
+    return (
+      <div className="flex items-center gap-2">
+        <span
+          title={sync.quota_reason}
+          className="rounded-lg bg-amber-100 px-2.5 py-1 text-xs font-medium text-amber-900 dark:bg-amber-950 dark:text-amber-300"
+        >
+          Classifier paused · retrying in {sync.quota_retry_in_seconds}s
+        </span>
+        {retry}
+      </div>
+    );
+  }
+
+  if ((sync?.pending_classification ?? 0) > 0) {
+    return (
+      <span className="text-xs text-slate-500 tabular-nums dark:text-slate-400">
+        Classifying · {sync?.pending_classification} left
+      </span>
+    );
+  }
+
   return (
     <div className="flex items-center gap-2">
-      {start.isError && (
+      {failed && (
+        <span
+          title={sync?.error ?? undefined}
+          className="max-w-64 truncate text-xs text-rose-600 dark:text-rose-400"
+        >
+          Import {sync?.status}: {sync?.error ?? "unknown error"}
+        </span>
+      )}
+      {!failed && start.isError && (
         <span
           title={(start.error as Error).message}
           className="max-w-56 truncate text-xs text-rose-600 dark:text-rose-400"
@@ -68,14 +142,66 @@ function SyncButton() {
           {(start.error as Error).message}
         </span>
       )}
-      <button
-        type="button"
-        onClick={() => start.mutate()}
-        disabled={start.isPending}
-        className="rounded-lg border border-slate-300 px-3 py-1.5 text-xs font-medium text-slate-700 transition hover:bg-slate-100 disabled:opacity-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+      {!failed && sync?.watcher_running && (
+        <span
+          title={
+            sync.last_sync_at
+              ? `Last checked ${new Date(sync.last_sync_at).toLocaleString()}`
+              : undefined
+          }
+          className="hidden text-xs text-slate-500 lg:inline dark:text-slate-400"
+        >
+          Watching for new mail
+        </span>
+      )}
+      {retry}
+    </div>
+  );
+}
+
+/**
+ * Token prompt for a protected deployment.
+ *
+ * Shown only when the server actually rejects a request with 401, so a local
+ * run with no `APP_AUTH_TOKEN` never sees it. Not a login — there are no users
+ * here, just one shared secret guarding one person's mailbox.
+ */
+function TokenGate({ onSaved }: { onSaved: () => void }) {
+  const [value, setValue] = useState("");
+
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-slate-50 px-6 dark:bg-slate-950">
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          if (!value.trim()) return;
+          setToken(value.trim());
+          onSaved();
+        }}
+        className="w-full max-w-sm rounded-xl border border-slate-200 bg-white p-6 dark:border-slate-800 dark:bg-slate-900"
       >
-        {start.isPending ? "Starting…" : "Import mail"}
-      </button>
+        <h1 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+          Access token required
+        </h1>
+        <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+          This server has <code className="font-mono">APP_AUTH_TOKEN</code> set. Paste it to
+          continue; it is stored in this browser only.
+        </p>
+        <input
+          type="password"
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          autoFocus
+          className="mt-4 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:ring-2 focus:ring-sky-500 focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
+        />
+        <button
+          type="submit"
+          disabled={!value.trim()}
+          className="mt-3 w-full rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-40 dark:bg-slate-100 dark:text-slate-900"
+        >
+          Continue
+        </button>
+      </form>
     </div>
   );
 }
@@ -87,11 +213,19 @@ export default function App() {
   // Single WebSocket for the whole app — mounted once, here.
   const { state, toasts, dismissToast } = useNotifications();
 
-  const { data: health } = useQuery({ queryKey: ["health"], queryFn: api.health });
+  const health = useQuery({ queryKey: ["health"], queryFn: api.health });
   const { data: notifications } = useQuery({
     queryKey: ["notifications"],
     queryFn: () => api.notifications(false),
   });
+
+  // The server is the authority on whether a token is needed; asking for one up
+  // front would put a password box in front of every local dev run.
+  const queryClient = useQueryClient();
+  const unauthorised = health.error instanceof ApiError && health.error.status === 401;
+  if (unauthorised) {
+    return <TokenGate onSaved={() => queryClient.invalidateQueries()} />;
+  }
 
   const openApplicationTab = (id: number) => {
     setOpenApplication(id);
@@ -132,24 +266,24 @@ export default function App() {
           </nav>
 
           <div className="ml-auto flex items-center gap-3">
-            {health && !health.gmail_usable && (
+            {health.data && !health.data.gmail_usable && (
               <span
-                title={[health.gmail_error, health.gmail_hint].filter(Boolean).join(" ")}
+                title={[health.data.gmail_error, health.data.gmail_hint].filter(Boolean).join(" ")}
                 className="max-w-96 truncate rounded-lg bg-amber-100 px-2.5 py-1 text-xs font-medium text-amber-900 dark:bg-amber-950 dark:text-amber-300"
               >
                 {/* Distinguish "no credentials" from "credentials fine, API
                     unreachable" — the fixes are completely different. */}
-                {health.gmail_authorised
-                  ? (health.gmail_error ?? "Gmail unavailable")
+                {health.data.gmail_authorised
+                  ? (health.data.gmail_error ?? "Gmail unavailable")
                   : "Gmail not connected"}
               </span>
             )}
-            {health?.gmail_address && (
+            {health.data?.gmail_address && (
               <span className="hidden text-xs text-slate-500 sm:inline dark:text-slate-400">
-                {health.gmail_address}
+                {health.data.gmail_address}
               </span>
             )}
-            <SyncButton />
+            <SyncIndicator />
             <ConnectionPill state={state} />
           </div>
         </div>

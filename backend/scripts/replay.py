@@ -12,6 +12,8 @@ moved — without burning Gmail quota or waiting on a re-sync.
 from __future__ import annotations
 
 import argparse
+import builtins
+import functools
 import sys
 from pathlib import Path
 
@@ -64,46 +66,68 @@ def main() -> int:
     args = parse_args()
     init_db()
 
+    # Output is usually redirected to a file, where Python block-buffers it and
+    # a long run looks like a hung one for minutes at a time.
+    print = functools.partial(builtins.print, flush=True)  # noqa: A001
+
     with session_scope() as session:
         emails = select_emails(session, args)
-        if not emails:
+        ids = [e.id for e in emails]
+        if not ids:
             print("No emails matched.")
             return 0
 
-        print(f"Replaying {len(emails)} email(s){' (dry run)' if args.dry_run else ''}\n")
+    print(f"Replaying {len(ids)} email(s){' (dry run)' if args.dry_run else ''}\n")
 
-        changed = 0
-        for email in emails:
-            before = email.is_job_related
-            before_source = email.classification_source
+    changed = 0
+    failed = 0
 
-            if args.dry_run:
-                verdict = classify_mod.classify(session, email)
-                after = verdict.is_job_related
-                confidence = verdict.confidence
-            else:
-                result = pipeline.process_email(session, email, reclassify=True)
-                after = result["email"]["is_job_related"]
-                confidence = result["email"]["confidence"]
+    for index, email_id in enumerate(ids, start=1):
+        # One session per email, committed as it goes. A single run can take
+        # tens of minutes on a local model, and wrapping the whole loop in one
+        # transaction meant one slow message threw away every verdict before
+        # it — which is a long wait to repeat for no reason.
+        try:
+            with session_scope() as session:
+                email = session.get(Email, email_id)
+                if email is None:
+                    continue
 
-            if before != after:
-                changed += 1
-                marker = "CHANGED"
-            else:
-                marker = "same   "
+                before = email.is_job_related
+                before_source = email.classification_source
+                subject = (email.subject or "(no subject)")[:50]
 
-            subject = (email.subject or "(no subject)")[:50]
-            print(
-                f"[{marker}] {before!s:>5} -> {after!s:<5} "
-                f"({confidence:.2f} via {before_source or 'new'}) {subject}"
-            )
+                if args.dry_run:
+                    verdict = classify_mod.classify(session, email)
+                    after = verdict.is_job_related
+                    confidence = verdict.confidence
+                    session.rollback()
+                else:
+                    result = pipeline.process_email(session, email, reclassify=True)
+                    after = result["email"]["is_job_related"]
+                    confidence = result["email"]["confidence"]
+                    retracted = len(result.get("retracted_applications") or [])
+                    if retracted:
+                        subject = f"{subject}  [-{retracted} application]"
+        except Exception as exc:  # noqa: BLE001 - report and keep going
+            failed += 1
+            print(f"[FAILED ] {index}/{len(ids)} {str(exc)[:110]}")
+            continue
 
-        if args.dry_run:
-            session.rollback()
+        if before != after:
+            changed += 1
+            marker = "CHANGED"
+        else:
+            marker = "same   "
 
-        print(f"\n{changed} of {len(emails)} verdict(s) changed.")
-        if args.dry_run:
-            print("Dry run - nothing was written.")
+        print(
+            f"[{marker}] {before!s:>5} -> {after!s:<5} "
+            f"({confidence:.2f} via {before_source or 'new'}) {subject}"
+        )
+
+    print(f"\n{changed} of {len(ids)} verdict(s) changed; {failed} failed.")
+    if args.dry_run:
+        print("Dry run - nothing was written.")
 
     return 0
 

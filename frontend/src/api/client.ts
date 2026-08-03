@@ -28,10 +28,34 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * Shared secret for a protected deployment.
+ *
+ * Kept in localStorage rather than a cookie on purpose: a cookie would be
+ * attached automatically to cross-site requests, which is exactly the CSRF
+ * shape this app has no defence against. A header has to be set deliberately,
+ * so a hostile page cannot borrow the session.
+ */
+const TOKEN_KEY = "jobmail.token";
+
+export function getToken(): string {
+  return localStorage.getItem(TOKEN_KEY) ?? "";
+}
+
+export function setToken(token: string): void {
+  if (token) localStorage.setItem(TOKEN_KEY, token);
+  else localStorage.removeItem(TOKEN_KEY);
+}
+
+function authHeaders(): Record<string, string> {
+  const token = getToken();
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
-    headers: { "Content-Type": "application/json" },
     ...init,
+    headers: { "Content-Type": "application/json", ...authHeaders(), ...init?.headers },
   });
 
   if (!response.ok) {
@@ -127,7 +151,7 @@ export async function streamChat(
 ): Promise<void> {
   const response = await fetch("/api/chat/stream", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...authHeaders() },
     body: JSON.stringify({ message, history }),
     signal,
   });

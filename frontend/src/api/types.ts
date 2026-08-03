@@ -37,6 +37,15 @@ export interface SyncStatus {
   done: number;
   error: string | null;
   last_history_id: string | null;
+  /** Imported but not yet classified. Import and classification run at very
+   *  different speeds, so this can stay high long after `running` goes false. */
+  pending_classification: number;
+  watcher_running: boolean;
+  last_sync_at: string | null;
+  quota_blocked: boolean;
+  quota_retry_in_seconds: number;
+  quota_reason: string;
+  quota_deferred: number;
 }
 
 export interface EmailSummary {

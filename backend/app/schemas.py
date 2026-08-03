@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ORMModel(BaseModel):
@@ -61,6 +61,13 @@ class SyncStatus(BaseModel):
     done: int = 0
     error: str | None = None
     last_history_id: str | None = None
+    # Importing and classifying are separate stages with very different speeds:
+    # a local model takes tens of seconds per email, so an import can finish
+    # while the board stays empty for a long time afterwards. Reporting only
+    # import progress makes that look like nothing happened.
+    pending_classification: int = 0
+    watcher_running: bool = False
+    last_sync_at: datetime | None = None
     # LLM quota back-off. Deferred emails stay unprocessed and are retried on
     # the next start rather than being classified with a degraded fallback.
     quota_blocked: bool = False
@@ -192,14 +199,23 @@ class NotificationPage(BaseModel):
 # --------------------------------------------------------------------------
 
 
+# Bounds, not guesses. An unbounded message or history is a free way to make the
+# server hold megabytes and hand them to a model that charges (or, locally,
+# thrashes) per token. The loop already trims to the last 12 turns, so a longer
+# history was never read — it was only ever parsed and dropped.
+MAX_CHAT_MESSAGE_CHARS = 4_000
+MAX_CHAT_TURN_CHARS = 8_000
+MAX_CHAT_HISTORY_TURNS = 40
+
+
 class ChatTurn(BaseModel):
     role: str  # "user" | "model"
-    content: str
+    content: str = Field(max_length=MAX_CHAT_TURN_CHARS)
 
 
 class ChatRequest(BaseModel):
-    message: str
-    history: list[ChatTurn] = []
+    message: str = Field(min_length=1, max_length=MAX_CHAT_MESSAGE_CHARS)
+    history: list[ChatTurn] = Field(default_factory=list, max_length=MAX_CHAT_HISTORY_TURNS)
 
 
 class Citation(BaseModel):

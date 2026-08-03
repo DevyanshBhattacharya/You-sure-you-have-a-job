@@ -111,7 +111,36 @@ def enqueue_unprocessed(limit: int = 1000) -> int:
 # --------------------------------------------------------------------------
 
 
+async def _backlog_sweeper(interval: float, limit: int) -> None:
+    """Re-queue stored-but-unclassified mail, forever.
+
+    The startup sweep alone isn't enough. It is capped at `limit`, so a backlog
+    larger than that keeps a remainder that nothing picks up; and the work queue
+    is in memory, so anything queued when the process stops is lost while its
+    row stays `processed_at IS NULL`. Either way the dashboard shows mail that
+    is imported but never classified, and the only cure is a restart — which is
+    exactly the "press Import again" loop this is meant to end.
+
+    Only sweeps once the queue has drained, so it never stacks duplicates on
+    top of work already in flight.
+    """
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            if work_queue.qsize() > 0:
+                continue
+            queued = await asyncio.to_thread(enqueue_unprocessed, limit)
+            if queued:
+                log.info("Backlog sweep queued %d email(s)", queued)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - a sweep failure must not end the loop
+            log.exception("Backlog sweep failed")
+
+
 def start_workers(count: int = WORKER_COUNT) -> None:
+    from app.config import get_settings
+
     loop = asyncio.get_running_loop()
 
     # Drop handles left over from a previous loop (a second app instance in the
@@ -125,6 +154,15 @@ def start_workers(count: int = WORKER_COUNT) -> None:
     for i in range(count):
         _tasks.append(asyncio.create_task(_worker(i), name=f"pipeline-worker-{i}"))
     log.info("Started %d pipeline worker(s)", count)
+
+    settings = get_settings()
+    if settings.backlog_sweep_seconds > 0:
+        _tasks.append(
+            asyncio.create_task(
+                _backlog_sweeper(settings.backlog_sweep_seconds, settings.backlog_batch_limit),
+                name="backlog-sweeper",
+            )
+        )
 
 
 async def stop_workers() -> None:
@@ -263,16 +301,30 @@ def process_email(session: Session, email: Email, *, reclassify: bool = False) -
             # A correction has to undo the previous verdict's work, or a fixed
             # classifier can never clean up after a broken one.
             result["retracted_applications"] = resolve_mod.retract(session, email)
+            # Including its searchable text: indexing only ever ran on the way
+            # in, so a corrected email stayed in the knowledge base and the Q&A
+            # agent went on quoting it as evidence about the job search.
+            indexer.remove_email(session, email)
         return result
 
     outcome = resolve_mod.apply(session, email, verdict, reclassify=reclassify)
     session.flush()
 
-    result["application"] = outcome.application_payload()
-    result["notifications"] = [n.payload() for n in outcome.notifications]
+    if outcome is None:
+        # Job-related, but not an application this person made — a job alert, an
+        # advert, cold outreach. It stays searchable in the knowledge base and
+        # visible in the inbox; it just doesn't reach the board.
+        if reclassify:
+            result["retracted_applications"] = resolve_mod.retract(session, email)
+        result["tracked"] = False
+    else:
+        result["tracked"] = True
+        result["application"] = outcome.application_payload()
+        result["notifications"] = [n.payload() for n in outcome.notifications]
 
+    application_id = outcome.application.id if outcome is not None else None
     try:
-        indexer.index_email(session, email, application_id=outcome.application.id)
+        indexer.index_email(session, email, application_id=application_id)
     except Exception:  # noqa: BLE001 - a KB failure must not lose the extraction
         log.exception("Indexing failed for email %s", email.id)
 

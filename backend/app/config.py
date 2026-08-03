@@ -42,6 +42,15 @@ class Settings(BaseSettings):
     # warning), and looks like the model ignoring its instructions. A full email
     # or a tool result listing every application clears 4096 easily.
     ollama_num_ctx: int = 16384
+    # Context for schema-constrained extraction, which is a different workload:
+    # the prompt is capped (classify.MAX_PROMPT_BODY_CHARS) at roughly 2k tokens
+    # and the output is a small object, so the chat window above is pure waste
+    # here — and not harmless waste. The KV cache for a window is allocated in
+    # VRAM next to the weights, so an oversized one evicts layers to the CPU.
+    # Measured on qwen3:4b (5.1 GB): at 16384 only 2.6 GB stayed resident and a
+    # single classification ran past ten minutes; sized to the prompt, the whole
+    # model stays on the GPU. Raise this only if truncation warnings appear.
+    ollama_extraction_num_ctx: int = 6144
     # Reasoning during *chat* (the Q&A agent). Keep it on for models that
     # support it: setting this false does not stop a reasoning model reasoning,
     # it stops Ollama separating the reasoning into its own `thinking` field, so
@@ -74,12 +83,29 @@ class Settings(BaseSettings):
     process_backlog_on_start: bool = True
     backlog_batch_limit: int = 1000
 
+    # How often to re-sweep for stored-but-unclassified mail. The startup sweep
+    # is capped at `backlog_batch_limit`, and anything queued when the process
+    # stops is lost with the in-memory queue; without a repeating sweep those
+    # rows sit unprocessed until someone restarts the server. Set 0 to disable.
+    backlog_sweep_seconds: int = 120
+
     # Restart an import that a crash or a dropped connection left unfinished.
     # Messages already stored are skipped, so this resumes rather than repeats.
     resume_backfill_on_start: bool = True
 
+    # Run the first import automatically, so the app fills itself in rather than
+    # waiting for someone to find the "Import mail" button. Only fires when no
+    # import has ever completed; after that the watcher keeps things current.
+    auto_backfill_on_start: bool = True
+
     # Server
     cors_origins: str = "http://localhost:5173"
+
+    # Shared secret guarding every /api and /ws route. Empty means no auth,
+    # which is only safe bound to loopback — this app serves the full text of a
+    # mailbox and will summarise it on request. Generate one with:
+    #   python -c "import secrets; print(secrets.token_urlsafe(32))"
+    app_auth_token: str = ""
 
     @property
     def credentials_path(self) -> Path:

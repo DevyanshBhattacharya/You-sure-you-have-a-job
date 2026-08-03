@@ -165,17 +165,26 @@ class OllamaProvider:
     def _client(self) -> httpx.Client:
         return httpx.Client(timeout=httpx.Timeout(self._settings.ollama_timeout_seconds))
 
-    def _options(self, temperature: float) -> dict:
+    def _options(self, temperature: float, *, num_ctx: int | None = None) -> dict:
         # num_ctx is not optional. Ollama defaults every model to 4096 tokens no
         # matter its real capacity, then silently discards the overflow from the
         # front of the prompt — taking the system instruction and the question
         # with it. See `_warn_if_truncated`.
+        #
+        # Nor is one value right for everything. The window is not free: its KV
+        # cache is allocated in VRAM alongside the weights, so an oversized one
+        # evicts layers to the CPU. Measured on qwen3:4b (5.1 GB) with a ~2k
+        # token classification prompt: at num_ctx 16384 only 2.6 GB stayed
+        # resident and a single call ran for over ten minutes; the same call
+        # sized to the prompt keeps the whole model on the GPU. Callers that
+        # need a big window (the Q&A agent, whose tool results are large) ask
+        # for one; extraction does not.
         return {
             "temperature": temperature,
-            "num_ctx": self._settings.ollama_num_ctx,
+            "num_ctx": num_ctx or self._settings.ollama_num_ctx,
         }
 
-    def _warn_if_truncated(self, payload: dict, model_id: str) -> None:
+    def _warn_if_truncated(self, payload: dict, model_id: str, limit: int | None = None) -> None:
         """Surface a context overflow, which Ollama itself reports as success.
 
         `prompt_eval_count` is what the model actually saw. When it lands at the
@@ -183,7 +192,7 @@ class OllamaProvider:
         dropped — the model answered a question it could no longer read.
         """
         seen = int(payload.get("prompt_eval_count") or 0)
-        limit = self._settings.ollama_num_ctx
+        limit = limit or self._settings.ollama_num_ctx
         if seen and seen >= limit - 8:
             log.warning(
                 "Ollama truncated the prompt for %s: %d tokens evaluated against a "
@@ -220,6 +229,17 @@ class OllamaProvider:
         return [m["name"] for m in response.json().get("models", [])]
 
     def _unreachable(self, exc: Exception) -> ProviderUnavailableError:
+        # A read timeout is not an unreachable server — it is a server that
+        # accepted the request and is still thinking. Telling someone to run
+        # `ollama serve` when it is already running (and visibly busy) sends
+        # them to fix the one thing that isn't broken.
+        if isinstance(exc, httpx.ReadTimeout | httpx.WriteTimeout | httpx.PoolTimeout):
+            return ProviderUnavailableError(
+                f"Ollama did not respond within {self._settings.ollama_timeout_seconds:.0f}s. "
+                f"The model ({self._settings.ollama_model}) is still generating, not down — "
+                "raise OLLAMA_TIMEOUT_SECONDS, lower OLLAMA_NUM_CTX, or use a smaller model.",
+                retry_after=30.0,
+            )
         return ProviderUnavailableError(
             f"Ollama is not reachable at {self._settings.ollama_base_url} ({exc}). "
             "Start it with `ollama serve`.",
@@ -258,6 +278,7 @@ class OllamaProvider:
         temperature: float = 0.0,
     ) -> JSONResult:
         model_id = model or self._settings.ollama_model
+        extraction_ctx = self._settings.ollama_extraction_num_ctx
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
@@ -279,11 +300,14 @@ class OllamaProvider:
             # with it off. Nothing is lost by disabling it, because the schema
             # already prevents prose from reaching the output.
             "think": False,
-            "options": self._options(temperature),
+            # Sized to the prompt, not to the Q&A agent's needs. Extraction
+            # inputs are capped (classify.MAX_PROMPT_BODY_CHARS), so a bigger
+            # window buys nothing and costs the VRAM the weights need.
+            "options": self._options(temperature, num_ctx=extraction_ctx),
         }
 
         data = self._post("/api/chat", payload)
-        self._warn_if_truncated(data, model_id)
+        self._warn_if_truncated(data, model_id, extraction_ctx)
         text = strip_thinking((data.get("message") or {}).get("content") or "")
         if not text.strip():
             raise LLMUnavailableError(f"Empty response from Ollama model {model_id}")

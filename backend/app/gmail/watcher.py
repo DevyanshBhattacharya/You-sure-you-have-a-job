@@ -108,9 +108,40 @@ def _poll_once() -> None:
         statestore.set_(session, statestore.LAST_SYNC_AT, datetime.now(UTC).isoformat())
 
 
+def _resync_days() -> int:
+    """How far back to sweep when the history cursor has expired.
+
+    Gmail keeps roughly a week of history, so a machine that was off for longer
+    comes back to a dead cursor. Sweeping a fixed three days would then skip
+    every message that arrived in between — silently, and permanently, since
+    the cursor is reset afterwards either way. Measure the gap instead, and use
+    the fixed window only as a floor.
+    """
+    with session_scope() as session:
+        last = statestore.get(session, statestore.LAST_SYNC_AT)
+
+    if not last:
+        return get_settings().backfill_default_days
+
+    try:
+        since = datetime.fromisoformat(last)
+    except ValueError:
+        return get_settings().backfill_default_days
+
+    if since.tzinfo is None:
+        since = since.replace(tzinfo=UTC)
+
+    gap = (datetime.now(UTC) - since).days + 1
+    # A day of slack for timezone skew, capped so a long-dead install doesn't
+    # silently re-import a decade of mail.
+    return max(RESYNC_WINDOW_DAYS, min(gap + 1, get_settings().backfill_default_days))
+
+
 def _resync_window() -> tuple[list[str], str | None]:
     """Recover from an expired cursor by sweeping a recent window."""
-    after = (datetime.now(UTC) - timedelta(days=RESYNC_WINDOW_DAYS)).strftime("%Y/%m/%d")
+    days = _resync_days()
+    after = (datetime.now(UTC) - timedelta(days=days)).strftime("%Y/%m/%d")
+    log.info("Resync sweeping %d day(s) back to %s", days, after)
     ids = gmail_client.list_message_ids(f"after:{after} -in:chats")
 
     with session_scope() as session:

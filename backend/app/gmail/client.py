@@ -31,9 +31,13 @@ log = logging.getLogger(__name__)
 T = TypeVar("T")
 
 # Transport faults, not API rejections. These say nothing about the request and
-# everything about the network between here and Google — a proxy resetting a
-# connection, a flaky link, a DNS hiccup. `[SSL: WRONG_VERSION_NUMBER]` is the
-# usual shape when something intercepts TLS mid-handshake.
+# everything about the link between here and Google: a flaky connection, a DNS
+# hiccup, a reset.
+#
+# `ssl.SSLError` is listed because a genuinely corrupted stream can happen, but
+# note that a *storm* of `[SSL: WRONG_VERSION_NUMBER]` is not a network problem
+# at all — it is two threads sharing one httplib2 connection. Retrying that only
+# makes them collide again. See gmail/auth.py:get_service.
 _TRANSIENT_EXCEPTIONS = (
     ssl.SSLError,
     socket.gaierror,  # DNS

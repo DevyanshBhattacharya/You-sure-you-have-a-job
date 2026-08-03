@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from app.agent.classify import Extraction, Verdict
 from app.agent.resolve import apply
 from app.main import app
+from app.models import Application
 from tests.fixtures import make_email
 
 
@@ -186,3 +187,58 @@ class TestWebSocket:
             hello = ws.receive_json()
             assert hello["topic"] == "connected"
             assert "notification.created" in hello["data"]["topics"]
+
+
+class TestManualCorrectionActs:
+    """The override buttons have to change the board, not just a label.
+
+    Marking a bogus entry "not job related" used to leave the application it had
+    already created sitting on the board, and marking a missed acknowledgement
+    "job related" changed a flag and nothing else. Neither was a correction.
+    """
+
+    def test_rejecting_an_email_removes_its_application(self, client, db):
+        email = make_email(db, subject="Torinit is hiring for a Remote role")
+        apply(db, email, job_verdict(company="Torinit", event_type="applied"))
+        db.commit()
+        assert db.query(Application).count() == 1
+
+        body = client.post(
+            f"/api/emails/{email.id}/classification", json={"is_job_related": False}
+        ).json()
+
+        assert body["is_job_related"] is False
+        assert db.query(Application).count() == 0
+
+    def test_rejecting_keeps_an_application_that_has_other_evidence(self, db, client):
+        """Only applications left with no events at all are removed."""
+        first = make_email(db, gmail_id="a", thread_id="t", subject="Thanks for applying")
+        outcome = apply(db, first, job_verdict(company="Acme", event_type="applied"))
+        app_id = outcome.application.id
+
+        second = make_email(db, gmail_id="b", thread_id="t", subject="Interview")
+        apply(db, second, job_verdict(company="Acme", event_type="interview_scheduled"))
+        db.commit()
+
+        client.post(f"/api/emails/{second.id}/classification", json={"is_job_related": False})
+
+        assert db.get(Application, app_id) is not None
+
+    def test_a_confirmed_email_skips_the_prefilter_next_time(self, db):
+        """A correction that lasts only until the next re-classification is not
+        a correction — the prefilter would just re-reject it."""
+        from app.agent import classify as classify_mod
+
+        email = make_email(
+            db, subject="I want to connect", sender="invitations@linkedin.com"
+        )
+        assert classify_mod.classify(db, email).source == "prefilter"
+
+        email.is_job_related = True
+        email.classification_source = "manual"
+        db.flush()
+
+        assert classify_mod.is_manually_confirmed(email) is True
+        # No LLM is configured in tests, so this proves only that the prefilter
+        # no longer short-circuits it — the verdict now comes from further down.
+        assert classify_mod.classify(db, email).source != "prefilter"

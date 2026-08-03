@@ -42,9 +42,13 @@ def chat_stream(payload: ChatRequest) -> StreamingResponse:
         try:
             for event in qa.stream_answer(session, payload.message, history):
                 yield f"data: {json.dumps(event)}\n\n"
-        except Exception as exc:  # noqa: BLE001
+        except Exception:  # noqa: BLE001
+            # Logged in full, reported in outline. An unhandled exception string
+            # can carry file paths, connection strings and query fragments; the
+            # person reading the chat window can do nothing with any of it.
             log.exception("Chat stream failed")
-            yield f"data: {json.dumps({'type': 'error', 'message': str(exc)})}\n\n"
+            message = "Something went wrong answering that. The server log has the details."
+            yield f"data: {json.dumps({'type': 'error', 'message': message})}\n\n"
         finally:
             session.close()
 

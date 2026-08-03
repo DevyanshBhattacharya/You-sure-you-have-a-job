@@ -163,7 +163,19 @@ def search_emails(
     if not hits:
         return _keyword_fallback(session, query, k, reason="no semantic matches")
 
-    return {"results": hydrate_hits(session, hits)}
+    result = {"results": hydrate_hits(session, hits)}
+
+    # Switching embedding model leaves the old vectors unsearchable — they are
+    # a different width, so cosine similarity is undefined against them. The
+    # store skips them, which is correct and completely silent. Say so, or the
+    # agent reports a confident answer drawn from part of the mailbox.
+    stale = indexer.stale_dimension_count(session)
+    if stale:
+        result["coverage_warning"] = (
+            f"{stale} passage(s) were embedded by a different model and cannot be "
+            "searched. Answers may be incomplete; run scripts/reindex_kb.py."
+        )
+    return result
 
 
 def _keyword_fallback(session: Session, query: str, k: int, *, reason: str) -> dict:
@@ -317,7 +329,12 @@ def dispatch(session: Session, name: str, args: dict[str, Any]) -> dict:
     try:
         return fn(session, **(args or {}))
     except TypeError as exc:
+        # Argument shape is the model's own mistake and it can correct for it,
+        # so this one is worth echoing back.
         return {"error": f"Bad arguments for {name}: {exc}"}
-    except Exception as exc:  # noqa: BLE001 - the model should see the failure
+    except Exception:  # noqa: BLE001 - the model should know it failed, not why
+        # The reason goes to the log, not into the transcript: an exception
+        # string can carry file paths and query fragments, and everything the
+        # model puts in a tool result can end up in the visible answer.
         log.exception("Tool %s failed", name)
-        return {"error": f"{name} failed: {exc}"}
+        return {"error": f"{name} failed. Try a different approach or say you could not check."}

@@ -1,5 +1,6 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { getToken } from "../api/client";
 import type { Notification, SocketMessage } from "../api/types";
 
 export type ConnectionState = "connecting" | "open" | "closed";
@@ -84,7 +85,12 @@ export function useNotifications() {
 
     const connect = () => {
       const scheme = window.location.protocol === "https:" ? "wss" : "ws";
-      const socket = new WebSocket(`${scheme}://${window.location.host}/ws/notifications`);
+      // Query string, not a header: the browser WebSocket API gives no way to
+      // set headers on the handshake. The server also checks Origin, since
+      // CORS does not apply to WebSockets at all.
+      const token = getToken();
+      const auth = token ? `?token=${encodeURIComponent(token)}` : "";
+      const socket = new WebSocket(`${scheme}://${window.location.host}/ws/notifications${auth}`);
       socketRef.current = socket;
       setState("connecting");
 

@@ -12,6 +12,7 @@ import logging
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
+from app import security
 from app.events import (
     APPLICATION_UPDATED,
     EMAIL_PROCESSED,
@@ -31,6 +32,22 @@ HEARTBEAT_SECONDS = 25
 
 @router.websocket("/ws/notifications")
 async def notifications_socket(websocket: WebSocket) -> None:
+    # Checked before `accept()`, and checked here rather than in the HTTP
+    # middleware because that middleware never sees a WebSocket handshake.
+    #
+    # CORS does not apply to WebSockets, so without the Origin check any page
+    # the user happens to visit could open this socket and read their live
+    # notification feed — companies, subjects, interview times.
+    origin = websocket.headers.get("origin")
+    if not security.origin_is_allowed(origin):
+        log.warning("Rejected WebSocket from disallowed origin %r", origin)
+        await websocket.close(code=1008, reason="origin not allowed")
+        return
+
+    if not security.token_is_valid(websocket.query_params.get("token")):
+        await websocket.close(code=1008, reason="missing or invalid token")
+        return
+
     await websocket.accept()
 
     async with bus.subscribe(*TOPICS) as queue:

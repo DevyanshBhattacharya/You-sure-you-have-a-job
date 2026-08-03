@@ -55,12 +55,18 @@ def health(db: Session = Depends(get_db)) -> HealthResponse:
 
 
 @router.get("/sync/status", response_model=SyncStatus)
-def sync_status() -> SyncStatus:
+def sync_status(db: Session = Depends(get_db)) -> SyncStatus:
     from app.agent.pipeline import quota_state
+    from app.gmail.watcher import is_running as watcher_running
 
     quota = quota_state()
     return SyncStatus(
         **backfill.status(),
+        pending_classification=db.scalar(
+            select(func.count()).select_from(Email).where(Email.processed_at.is_(None))
+        )
+        or 0,
+        watcher_running=watcher_running(),
         quota_blocked=quota["blocked"],
         quota_retry_in_seconds=quota["retry_in_seconds"],
         quota_reason=quota["reason"],

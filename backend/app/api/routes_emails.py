@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -10,6 +12,7 @@ from app.db import get_db
 from app.models import Email, utcnow
 from app.schemas import ClassificationOverride, EmailDetail, EmailPage, EmailSummary
 
+log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/emails", tags=["emails"])
 
 
@@ -66,11 +69,19 @@ def override_classification(
     payload: ClassificationOverride,
     db: Session = Depends(get_db),
 ) -> EmailDetail:
-    """Manually correct a classification.
+    """Manually correct a classification, and act on the correction.
 
-    Recorded with source='manual' so these corrections can later be pulled out
-    as an evaluation set for the classifier prompt.
+    Flipping the flag alone was not a correction, it was a note-to-self: the
+    board is built from applications, so marking a missed acknowledgement "job
+    related" changed a label and nothing else, and marking a bogus entry "not
+    job related" left the application it had already created sitting there.
+
+    Recorded with source='manual' so the verdict survives later
+    re-classification, and so these corrections can be pulled out as an
+    evaluation set for the classifier prompt.
     """
+    from app.agent import pipeline, resolve
+
     email = db.get(Email, email_id)
     if email is None:
         raise HTTPException(status_code=404, detail="Email not found")
@@ -79,6 +90,24 @@ def override_classification(
     email.classification_source = "manual"
     email.classification_confidence = 1.0
     email.processed_at = utcnow()
+
+    retracted: list[int] = []
+    if not payload.is_job_related:
+        # Cheap and immediate: removing the timeline entry, its notifications
+        # and any application left with no events is pure database work.
+        retracted = resolve.retract(db, email)
+
     db.commit()
+
+    if payload.is_job_related:
+        # Needs the model to name the company and role, which is far too slow
+        # for a request handler, so it goes through the pipeline. `classify`
+        # sees source='manual' and skips the prefilter that rejected it.
+        pipeline.submit_email_id(email_id, reclassify=True)
+
     db.refresh(email)
+    if retracted:
+        log.info(
+            "Manual override on email %s retracted %d application(s)", email_id, len(retracted)
+        )
     return EmailDetail.model_validate(email)

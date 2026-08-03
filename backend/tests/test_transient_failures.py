@@ -149,3 +149,88 @@ class TestResumeAfterInterruption:
         self._set_state(db, "idle")
         assert backfill.resume_if_interrupted() is False
         assert started == []
+
+
+class TestServiceIsNotSharedBetweenThreads:
+    """`[SSL: WRONG_VERSION_NUMBER]` was a threading bug, not a TLS one.
+
+    `build()` creates one `httplib2.Http` and every request from that service
+    reuses it, but httplib2 is not thread-safe. The watcher polling while a
+    backfill imports put two threads on one TLS socket; each then read back
+    bytes meant for the other, and OpenSSL reported the garbled record header
+    as a wrong protocol version. Retrying just made them collide again.
+    """
+
+    @pytest.fixture
+    def fake_build(self, monkeypatch):
+        """Count service objects handed out, without touching Google."""
+        built: list[object] = []
+
+        def build(*_a, **_kw):
+            service = object()
+            built.append(service)
+            return service
+
+        monkeypatch.setattr("app.gmail.auth.build", build)
+        monkeypatch.setattr("app.gmail.auth.load_credentials", lambda **_kw: object())
+        from app.gmail import auth
+
+        auth.reset_service()
+        return built
+
+    def test_each_thread_gets_its_own_service(self, fake_build):
+        import threading
+
+        from app.gmail import auth
+
+        seen: dict[int, object] = {}
+
+        def grab() -> None:
+            seen[threading.get_ident()] = auth.get_service()
+
+        threads = [threading.Thread(target=grab) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert len(seen) == 4
+        # The whole point: no two threads may hold the same http object.
+        assert len({id(s) for s in seen.values()}) == 4
+
+    def test_a_thread_reuses_its_own_service(self, fake_build):
+        """Per-thread, not per-call — a thread keeps its connection pool."""
+        from app.gmail import auth
+
+        assert auth.get_service() is auth.get_service()
+        assert len(fake_build) == 1
+
+    def test_reset_invalidates_the_calling_thread(self, fake_build):
+        from app.gmail import auth
+
+        first = auth.get_service()
+        auth.reset_service()
+        assert auth.get_service() is not first
+
+    def test_reset_invalidates_other_threads_too(self, fake_build):
+        """A revoked token must not leave a stale service alive in a worker."""
+        import threading
+
+        from app.gmail import auth
+
+        results: list[object] = []
+
+        def grab() -> None:
+            results.append(auth.get_service())
+
+        worker = threading.Thread(target=grab)
+        worker.start()
+        worker.join()
+
+        auth.reset_service()
+
+        worker = threading.Thread(target=grab)
+        worker.start()
+        worker.join()
+
+        assert results[0] is not results[1]

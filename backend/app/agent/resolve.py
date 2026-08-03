@@ -131,27 +131,34 @@ def _similar(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, a, b).ratio()
 
 
+def find_by_thread(session: Session, email: Email) -> Application | None:
+    """Match on Gmail thread lineage.
+
+    The strongest signal there is: a reply chain is unambiguously about one
+    application, regardless of how the model named the company.
+    """
+    if not email.thread_id:
+        return None
+    return session.execute(
+        select(Application)
+        .join(ApplicationEvent, ApplicationEvent.application_id == Application.id)
+        .join(Email, Email.id == ApplicationEvent.email_id)
+        .where(Email.thread_id == email.thread_id, Email.id != email.id)
+        .order_by(ApplicationEvent.occurred_at.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+
+
 def find_application(
     session: Session, email: Email, extraction: Extraction | None
 ) -> Application | None:
     """Find the application this email belongs to, if any.
 
-    Order matters: thread lineage is the strongest signal because a reply chain
-    is unambiguously about one application, regardless of how the model named
-    the company.
+    Order matters: thread lineage first, then company and role.
     """
-    # 1. Same Gmail thread as an email we already filed.
-    if email.thread_id:
-        row = session.execute(
-            select(Application)
-            .join(ApplicationEvent, ApplicationEvent.application_id == Application.id)
-            .join(Email, Email.id == ApplicationEvent.email_id)
-            .where(Email.thread_id == email.thread_id, Email.id != email.id)
-            .order_by(ApplicationEvent.occurred_at.desc())
-            .limit(1)
-        ).scalar_one_or_none()
-        if row is not None:
-            return row
+    row = find_by_thread(session, email)
+    if row is not None:
+        return row
 
     company_norm = normalize_company(extraction.company if extraction else None)
     if not company_norm:
@@ -257,18 +264,82 @@ class Outcome:
         }
 
 
+# Events that only happen once someone has applied. A model that fills in
+# `recipient_applied` wrongly still can't schedule an interview out of thin air,
+# so these are trusted on their own.
+_IN_PROCESS_EVENTS = {
+    EventType.APPLIED,
+    EventType.ACKNOWLEDGEMENT,
+    EventType.SCREEN_SCHEDULED,
+    EventType.INTERVIEW_SCHEDULED,
+    EventType.ASSESSMENT_SENT,
+    EventType.OFFER,
+    EventType.REJECTION,
+    EventType.WITHDRAWN,
+}
+
+
+def is_own_application(verdict: Verdict, event_type: EventType) -> bool:
+    """Whether this email describes an application the recipient actually made.
+
+    The board is meant to hold applications, not job adverts. Three things have
+    to hold before an email is allowed to open one:
+
+    * the verdict came from the LLM — a heuristic fallback has no extraction and
+      no idea who applied to what, so it would name the application after the
+      sender's display name ("LinkedIn", "Smriti Jain", "Coursera");
+    * a company was actually named; and
+    * either the model says the recipient applied, or the event is one that
+      cannot happen before they did.
+
+    Cold recruiter outreach and job alerts fail this deliberately. They stay
+    job-related, searchable and visible in the inbox — they just don't become
+    something the user has to triage on the board.
+    """
+    if verdict.source not in ("llm", "manual") or verdict.extraction is None:
+        return False
+    if not normalize_company(verdict.extraction.company):
+        return False
+    return verdict.recipient_applied or event_type in _IN_PROCESS_EVENTS
+
+
 def apply(
     session: Session, email: Email, verdict: Verdict, *, reclassify: bool = False
-) -> Outcome:
+) -> Outcome | None:
+    """Record this email against an application. None if it isn't one.
+
+    Returning None is the normal path for job-related mail that isn't the
+    recipient's own application — a job alert, an advert, a cold approach.
+    """
     extraction = verdict.extraction
     event_type = event_type_of(extraction)
 
-    app = find_application(session, email, extraction)
+    if not is_own_application(verdict, event_type):
+        # A reply on a thread we already filed is still about that application,
+        # whatever this individual message looks like in isolation.
+        app = find_by_thread(session, email)
+        if app is None:
+            log.debug(
+                "Email %s is job-related but not the recipient's own application "
+                "(source=%s, event=%s); not opening one",
+                email.id,
+                verdict.source,
+                event_type.value,
+            )
+            return None
+    else:
+        app = find_application(session, email, extraction)
+
     created = False
 
     if app is None:
-        company = (extraction.company if extraction else "") or _fallback_company(email)
-        role = (extraction.role_title if extraction else "") or None
+        # Reachable only through is_own_application(), which already guaranteed
+        # an LLM extraction naming a company — hence no sender-display-name
+        # fallback here. That fallback is what produced applications called
+        # "LinkedIn" and "Coursera".
+        assert extraction is not None  # noqa: S101 - narrows the type, guarded above
+        company = extraction.company
+        role = extraction.role_title or None
         app = Application(
             company=company,
             company_normalized=normalize_company(company),
@@ -383,15 +454,6 @@ def _as_status(value) -> ApplicationStatus:
         return ApplicationStatus(value)
     except (ValueError, TypeError):
         return ApplicationStatus.DISCOVERED
-
-
-def _fallback_company(email: Email) -> str:
-    """Last resort when the model couldn't name a company."""
-    if email.from_name:
-        return email.from_name
-    if email.from_addr and "@" in email.from_addr:
-        return email.from_addr.rsplit("@", 1)[1]
-    return "Unknown"
 
 
 def _merge_details(app: Application, extraction: Extraction | None, email: Email) -> None:
